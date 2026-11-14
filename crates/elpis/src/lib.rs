@@ -11,6 +11,7 @@
 //! [`workdir::create_box`] from an sbx kit ([`kits`]), a pulled image ([`registry`]) or a template.
 
 pub mod boxfile;
+pub mod capsule;
 pub mod console;
 pub mod credproxy;
 pub mod events;
