@@ -9,6 +9,7 @@ A desktop GUI for the [elpis](../elpis) engine — start elpis VMs, watch their 
 - **Live log** per VM: the shim, Sailor, the guest kernel, container output and task events, colored like the CLI.
 - **host-port** box: let the container reach a Windows `127.0.0.1` port (e.g. Ollama on 11434).
 - **Terminal / Agent** buttons: open Windows Terminal running `elpis-run attach`, which joins the running VM over its shim ttrpc pipe and opens a TTY session. *Agent* runs the box's own agent command (a kit's or a Capsule's entrypoint). Several terminals can attach to one VM at once.
+- **Help window** (F1, the ? buttons, or the tray menu): the project's documentation, searchable and linked, offline; see below.
 - **Capsules** (a tab beside the box view): the whole Capsule workflow, see below.
 - **Trust & keys** (another tab): your signing policy and keys, see below.
 - **System tray** with Show and Quit.
@@ -16,6 +17,10 @@ A desktop GUI for the [elpis](../elpis) engine — start elpis VMs, watch their 
 ## Look and feel
 
 A plain dark UI: neutral greys, thin borders, flat surfaces, system fonts. Green is the only accent and is used sparingly: the primary action, the active tab and selection, focus, a running box and "good" status (amber and red mean caution and failure). Dark is the default; the ☾ button beside the name cycles dark, light and "follow my system" (remembered). All colours are variables at the top of `ui/index.html`. The app icon (`assets/elpis-icon.png`, an amphora in a hexagon) is the project's identity; `python scripts/make-icons.py` (needs Pillow) regenerates every size, `crates/elpis-gui/icons/*` and `ui/logo.png`. The TUI uses the same greys and green.
+
+## Help
+
+Press **F1** (or click a **?** button, or choose **Help** from the tray icon) to open the Help window beside the app. It shows the project's `docs/*.md`, embedded in the executable, so help and documentation are the same files: a contents tree, an "on this page" list, search across every section (`/` or `Ctrl+F` to focus it, `Enter` opens the first result), links between pages, copy buttons on commands, and Back and Forward (`Alt+←`, `Alt+→`). F1 and the ? buttons open the topic for where you are. Raw HTML in a document is shown as text, never run. The Rust side (`src/help.rs`) renders and indexes the pages; tests check that every doc is listed, every link lands on a real heading, and every topic the GUI asks for exists.
 
 ## Capsules
 

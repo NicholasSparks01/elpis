@@ -6,54 +6,18 @@
 <meta name="color-scheme" content="dark light" />
 <title>Elpis</title>
 <link rel="icon" type="image/png" href="logo.png" />
+<link rel="stylesheet" href="theme.css" />
 <style>
-  /* A plain dark UI: neutral greys, thin borders, flat surfaces. Green is the only accent and it is used sparingly:
-     the primary action, the active tab and selection, focus, a running box, and "good" status. Every colour below is
-     one of these variables, so the light theme is just a second set of values. */
-  :root {
-    color-scheme: dark;
-    --bg: #0d1117; --panel: #161b22; --panel2: #1c2128; --raised: #21262d; --well: #0a0d12;
-    --border: #30363d; --fg: #e6edf3; --dim: #8b949e;
-    --accent: #1f7a33; --accent-hover: #26913d; --accent-fg: #ffffff; --accent-text: #3fb950;
-    --green: #3fb950; --yellow: #d29922; --red: #ff7b72; --cyan: #56d4dd; --magenta: #d2a8ff; --blue: #79c0ff;
-    --scrim: rgba(1, 4, 9, .72);
-  }
-  :root[data-theme="light"] {
-    color-scheme: light;
-    --bg: #f6f8fa; --panel: #ffffff; --panel2: #f6f8fa; --raised: #eaeef2; --well: #f0f3f6;
-    --border: #d0d7de; --fg: #1f2328; --dim: #59636e;
-    --accent: #1a7f37; --accent-hover: #166b2e; --accent-fg: #ffffff; --accent-text: #187232;
-    --green: #187232; --yellow: #8a5d00; --red: #cf222e; --cyan: #0a6f7a; --magenta: #8250df; --blue: #0550ae;
-    --scrim: rgba(31, 35, 40, .45);
-  }
-  @media (prefers-color-scheme: light) {
-    :root:not([data-theme="dark"]) {
-      color-scheme: light;
-      --bg: #f6f8fa; --panel: #ffffff; --panel2: #f6f8fa; --raised: #eaeef2; --well: #f0f3f6;
-      --border: #d0d7de; --fg: #1f2328; --dim: #59636e;
-      --accent: #1a7f37; --accent-hover: #166b2e; --accent-fg: #ffffff; --accent-text: #187232;
-      --green: #187232; --yellow: #8a5d00; --red: #cf222e; --cyan: #0a6f7a; --magenta: #8250df; --blue: #0550ae;
-      --scrim: rgba(31, 35, 40, .45);
-    }
-  }
+  /* the main window's layout; colours and controls come from theme.css */
+  body { display: grid; grid-template-columns: 248px 1fr; height: 100vh; }
 
-  * { box-sizing: border-box; }
-  html, body { margin: 0; height: 100%; }
-  body {
-    background: var(--bg); color: var(--fg); font: 13px/1.5 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
-    display: grid; grid-template-columns: 248px 1fr; height: 100vh;
-  }
-  [hidden] { display: none !important; }
-  ::selection { background: color-mix(in srgb, var(--green) 35%, transparent); }
-  code, .mono { font-family: "Cascadia Mono", "Cascadia Code", "Consolas", monospace; font-size: 12px; }
-  :focus-visible { outline: 2px solid var(--accent-text); outline-offset: 1px; }
-  * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 
   /* sidebar: the brand and the boxes */
   #sidebar { background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
   .brand { padding: 14px 14px 12px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
   .brand .logo { width: 28px; height: 28px; border-radius: 7px; flex: none; }
   .brand b { font-size: 15px; font-weight: 600; letter-spacing: .02em; flex: 1; }
+  .brand .help-q { margin-right: 2px; }
   #theme { padding: 3px 7px; font-size: 13px; line-height: 1; background: transparent; border-color: transparent; color: var(--dim); }
   .sidehead { padding: 12px 14px 4px; color: var(--dim); font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
   #vmlist { overflow-y: auto; flex: 1; padding: 4px 8px; }
@@ -78,23 +42,6 @@
   .toolbar { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .toolbar h2 { margin: 0; font-size: 15px; font-weight: 600; flex: 1; min-width: 150px; }
 
-  button {
-    background: var(--raised); color: var(--fg); border: 1px solid var(--border); border-radius: 6px;
-    padding: 5px 12px; font-size: 12px; cursor: pointer; font-family: inherit; white-space: nowrap;
-  }
-  button:hover:not(:disabled) { border-color: var(--dim); }
-  button:disabled { opacity: .4; cursor: default; }
-  button.primary { background: var(--accent); color: var(--accent-fg); border-color: color-mix(in srgb, var(--accent-fg) 18%, transparent); font-weight: 600; }
-  button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: color-mix(in srgb, var(--accent-fg) 30%, transparent); }
-  button.danger { color: var(--red); }
-  button.danger:hover:not(:disabled) { border-color: var(--red); }
-  button.small { padding: 1px 9px; font-size: 11px; }
-  input[type=text], select, textarea {
-    background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; font-family: inherit; font-size: 12px;
-  }
-  input[type=text]::placeholder { color: color-mix(in srgb, var(--dim) 70%, transparent); }
-  input[type=text]:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent-text); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-text) 25%, transparent); }
-  input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; margin: 1px 0 0; flex: none; }
   .field { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 11px; }
   .field input { width: 70px; padding: 3px 7px; }
 
@@ -169,7 +116,8 @@
   #modal-root { position: fixed; inset: 0; pointer-events: none; }
   .scrim { position: fixed; inset: 0; background: var(--scrim); display: flex; align-items: flex-start; justify-content: center; padding-top: 8vh; pointer-events: auto; overflow-y: auto; }
   .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; width: min(560px, 92vw); box-shadow: 0 16px 40px rgba(1, 4, 9, .5); margin-bottom: 8vh; overflow: hidden; }
-  .modal header { padding: 12px 16px; font-size: 14px; font-weight: 600; border-bottom: 1px solid var(--border); }
+  .modal header { padding: 12px 16px; font-size: 14px; font-weight: 600; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; }
+  .modal header span { flex: 1; }
   .modal .mbody { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
   .modal footer { padding: 10px 16px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; align-items: center; background: var(--panel2); }
   .modal footer .mprogress { margin-right: auto; color: var(--yellow); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
@@ -198,6 +146,7 @@
     <div class="brand">
       <img class="logo" src="logo.png" alt="" />
       <b>Elpis</b>
+      <button id="helpbtn" class="help-q" title="Help (F1)" aria-label="Help">?</button>
       <button id="theme" title="Theme" aria-label="Theme">◐</button>
     </div>
     <div class="sidehead">Boxes</div>
@@ -226,6 +175,7 @@
         <button id="term" disabled>Terminal&#8230;</button>
         <button id="agent" disabled title="Open the box's agent (a kit's or Capsule's entrypoint) in a terminal">Agent&#8230;</button>
         <button id="clear" title="Clear the log view">Clear</button>
+        <button id="helpbox" class="help-q" title="Help with boxes" aria-label="Help with boxes">?</button>
       </div>
       <div id="log"></div>
     </section>
@@ -243,6 +193,7 @@
         <button id="cbuild" title="Build a Capsule folder (with capsule.yaml) into your store">Build&#8230;</button>
         <button id="cpull" title="Download a Capsule from a registry">Pull&#8230;</button>
         <button id="crefresh" title="Re-read the store and re-check every Capsule">Refresh</button>
+        <button id="helpcaps" class="help-q" title="Help with Capsules" aria-label="Help with Capsules">?</button>
       </div>
       <div class="progress" id="cprogress"></div>
       <div class="split">

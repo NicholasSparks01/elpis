@@ -59,6 +59,25 @@ function toast(text, kind = 'info') {
 
 const failure = (e) => String(e && e.message ? e.message : e);
 
+// ---------------------------------------------------------------- help: the Help window, at a topic ("page" or "page#anchor")
+
+function helpTopic(topic) { invoke('open_help', { topic }).catch((e) => toast(failure(e), 'error')); }
+const helpBtn = (open, label = 'Help') => h('button', { class: 'help-q', title: label, 'aria-label': label, onclick: open }, '?');
+
+// The Help topic for each dialog, by the start of its title (a ? in the dialog's header opens it).
+const DIALOG_HELP = [
+  { title: 'Build a Capsule', help: 'capsules#building-a-capsule' },
+  { title: 'Pull a Capsule', help: 'capsules#sharing-through-a-registry' },
+  { title: 'Push ', help: 'capsules#sharing-through-a-registry' },
+  { title: 'Run ', help: 'capsules#running-a-capsule' },
+  { title: 'Your trust policy', help: 'capsules#signing-and-trust' },
+  { title: 'Sign', help: 'capsules#signing-and-trust' },
+  { title: 'New signing key', help: 'capsules#signing-and-trust' },
+  { title: 'Trust a key', help: 'capsules#signing-and-trust' },
+  { title: 'Fork', help: 'capsules#finding-and-forking' },
+  { title: 'Registry manifest', help: 'capsules#sharing-through-a-registry' },
+];
+
 /**
  * A dialog. `body` is a node; `actions` are {label, primary, danger, keepOpen, onClick(dialog)}; a click handler
  * may return a promise (the buttons are disabled while it runs) and a thrown error is shown in the dialog.
@@ -76,6 +95,7 @@ function dialog(title, body, actions, opts = {}) {
     setError(text) { errorLine.hidden = !text; errorLine.textContent = text || ''; },
   };
   const busy = (on) => buttons.forEach((b) => (b.disabled = on));
+  const topic = opts.help || (DIALOG_HELP.find((d) => title.startsWith(d.title)) || {}).help;
   for (const a of actions) {
     const b = h('button', { class: (a.primary ? 'primary ' : '') + (a.danger ? 'danger' : ''), text: a.label });
     b.addEventListener('click', async () => {
@@ -90,7 +110,7 @@ function dialog(title, body, actions, opts = {}) {
   }
   const scrim = h('div', { class: 'scrim', onmousedown: (e) => { if (e.target === scrim) api.close(); } },
     h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': title },
-      h('header', { text: title }),
+      h('header', null, h('span', { text: title }), topic && helpBtn(() => helpTopic(topic), 'Help with this')),
       h('div', { class: 'mbody' }, body, errorLine),
       h('footer', null, progress, buttons)));
   const onKey = (e) => { if (e.key === 'Escape' && root.lastElementChild === scrim) { e.stopImmediatePropagation(); api.close(); } };
@@ -215,6 +235,18 @@ $('agent').onclick = async () => {
 
 listen('log', (e) => addLine(e.payload.id, e.payload));
 listen('vm-state', (e) => { const vm = vms.get(e.payload.id); if (vm) { vm.running = e.payload.running; renderList(); updateButtons(); } });
+
+// ---------------------------------------------------------------- help buttons and F1
+
+function openContextHelp() {
+  if (view === 'capsules') helpTopic('gui#capsules');
+  else if (view === 'trust') helpTopic('gui#trust-and-keys');
+  else helpTopic('gui#boxes');
+}
+$('helpbtn').onclick = openContextHelp;
+$('helpbox').onclick = () => helpTopic('gui#boxes');
+$('helpcaps').onclick = () => helpTopic('gui#capsules');
+document.addEventListener('keydown', (e) => { if (e.key === 'F1') { e.preventDefault(); openContextHelp(); } });
 
 // ---------------------------------------------------------------- views
 
@@ -562,6 +594,7 @@ async function loadTrust() {
     catch (e) { require.checked = !require.checked; toast(failure(e), 'error'); }
   };
   root.append(h('div', null,
+    h('div', { class: 'keyline note', style: 'margin-bottom:12px' }, helpBtn(() => helpTopic('gui#trust-and-keys'), 'Help with trust and keys'), 'How trust and signing work'),
     h('h3', { text: 'Policy' }),
     h('label', { class: 'check-row' }, require, h('span', null, 'Only run Capsules signed by a key I trust',
       h('div', { class: 'note', text: 'Without this, an unsigned Capsule still runs after you grant what it asks for, and is marked unsigned. A modified Capsule never runs.' }))),

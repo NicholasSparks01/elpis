@@ -62,7 +62,7 @@ enum Command {
         #[command(subcommand)]
         action: TemplateAction,
     },
-    /// Build, inspect, list and remove Capsules: portable agent packages (see docs/capsule-manifest.md)
+    /// Build, run, share, sign and verify Capsules: portable agent packages (see docs/capsules.md)
     Capsule {
         #[command(subcommand)]
         action: CapsuleAction,
@@ -1282,4 +1282,33 @@ fn approvals(name: &str) -> Result<i32> {
         println!("\nanswer with: elpis-run policy --work {} allow|deny HOST  (applies on the box's next retry)", work.display());
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    /// The command-line reference (`docs/cli.md`, also shown in the GUI's Help window) has to mention every command,
+    /// so adding one without documenting it fails here.
+    #[test]
+    fn the_cli_reference_documents_every_command() {
+        fn walk(cmd: &clap::Command, path: &str, doc: &str, missing: &mut Vec<String>) {
+            for sub in cmd.get_subcommands() {
+                let name = sub.get_name();
+                if name == "help" {
+                    continue;
+                }
+                let full = if path.is_empty() { name.to_owned() } else { format!("{path} {name}") };
+                if sub.has_subcommands() {
+                    walk(sub, &full, doc, missing);
+                } else if !doc.contains(&format!("`{full}")) {
+                    missing.push(full);
+                }
+            }
+        }
+        let doc = include_str!("../../../docs/cli.md");
+        let mut missing = Vec::new();
+        walk(&super::Cli::command(), "", doc, &mut missing);
+        assert!(missing.is_empty(), "docs/cli.md doesn't document: {missing:?} (write each as `command ...` in a heading or table row)");
+    }
 }

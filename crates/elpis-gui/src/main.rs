@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod capsules;
+mod help;
 
 use elpis::session::{debug_root, default_shim};
 use elpis::{Config, Log, Session};
@@ -221,10 +222,12 @@ async fn open_terminal(state: State<'_, AppState>, id: String, command: String) 
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .manage(help::HelpState::default())
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "Show elpis", true, None::<&str>)?;
+            let help = MenuItem::with_id(app, "help", "Help", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let menu = Menu::with_items(app, &[&show, &help, &quit])?;
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("elpis")
@@ -235,6 +238,13 @@ fn main() {
                             let _ = w.show();
                             let _ = w.set_focus();
                         }
+                    }
+                    // windows are made off the main thread, as Tauri asks
+                    "help" => {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = help::show(&app, None).await;
+                        });
                     }
                     "quit" => app.exit(0),
                     _ => {}
@@ -249,6 +259,11 @@ fn main() {
             stop_vm,
             open_terminal,
             agent_command,
+            help::open_help,
+            help::help_pages,
+            help::help_page,
+            help::help_search,
+            help::help_take_topic,
             capsules::capsule_list,
             capsules::capsule_verify_all,
             capsules::capsule_detail,
