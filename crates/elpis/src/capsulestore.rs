@@ -195,6 +195,36 @@ impl Store {
         Capsule::parse(std::str::from_utf8(&manifest)?)
     }
 
+    /// The payload as an erofs layer, made once per payload digest and shared by every box from that Capsule.
+    /// None when the Capsule has no payload. Call after [`Store::load`], which has checked the archive.
+    pub fn payload_layer(&self, built: &Built) -> Result<Option<PathBuf>> {
+        let (Some(digest), Some(archive)) = (&built.payload_digest, built.payload_path()) else { return Ok(None) };
+        let layers = self.root.join(".layers");
+        let out = layers.join(format!("{}.erofs", digest.trim_start_matches("sha256:")));
+        if out.exists() {
+            return Ok(Some(out));
+        }
+        std::fs::create_dir_all(&layers)?;
+        // mkfs.erofs wants a plain tar
+        let tar = out.with_extension("tar.part");
+        let part = out.with_extension("erofs.part");
+        let result = (|| -> Result<()> {
+            let mut src = flate2::read::GzDecoder::new(std::fs::File::open(&archive).with_context(|| format!("reading {}", archive.display()))?);
+            let mut dst = std::io::BufWriter::new(std::fs::File::create(&tar)?);
+            std::io::copy(&mut src, &mut dst)?;
+            std::io::Write::flush(&mut dst)?;
+            crate::mkfs::erofs_from_tar(&tar, &part).context("converting the payload to a layer")?;
+            std::fs::rename(&part, &out)?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&tar);
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+        Ok(Some(out))
+    }
+
     /// Delete one built version (`NAME@VERSION`; a bare name is refused so nothing is removed by accident).
     pub fn remove(&self, spec: &str) -> Result<Built> {
         if !spec.contains('@') {

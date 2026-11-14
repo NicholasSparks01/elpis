@@ -15,6 +15,7 @@
 //! sized volumes are disks the same way (`vol-N.img`).
 
 use crate::boxfile::{BoxFile, Volume, shell_quote};
+use crate::capsule::{Capsule, Grants, Lock};
 use crate::kits::Kit;
 use crate::policy::{Action, Policy};
 use crate::registry::Image;
@@ -156,6 +157,23 @@ pub enum Source {
     Kit(Box<Kit>, Image),
     /// A saved template
     Template(String),
+    /// A built Capsule with its image pulled and the consumer's grants decided
+    Capsule(Box<CapsuleLaunch>),
+}
+
+/// Everything `create_box` needs to make a box from a Capsule. The caller has verified the Capsule, pulled its
+/// image and decided the grants; nothing here is looked up or approved later.
+pub struct CapsuleLaunch {
+    pub capsule: Capsule,
+    /// The Capsule's digest, recorded in `capsule.lock`
+    pub digest: String,
+    pub image: Image,
+    /// The payload as an erofs layer. It goes *under* the image's layers: overlayfs takes a directory's owner and
+    /// mode from the topmost layer that has it, and the payload's implicit parents are root-owned, so on top it
+    /// would take over a directory like `/home/agent` from the image. The cost: a file the image already has at
+    /// a payload path wins over the payload's.
+    pub payload_layer: Option<PathBuf>,
+    pub grants: Grants,
 }
 
 pub struct NewBox {
@@ -210,8 +228,9 @@ pub fn create_box(new: NewBox) -> Result<PathBuf> {
     let made = (|| -> Result<()> {
         match &new.source {
             Source::Copy(from) => fill_from_copy(&work, &new, from),
-            Source::Image(image) => fill_from_image(&work, &new, image, None),
-            Source::Kit(kit, image) => fill_from_image(&work, &new, image, Some(kit)),
+            Source::Image(image) => fill_from_image(&work, &new, image, None, None),
+            Source::Kit(kit, image) => fill_from_image(&work, &new, image, Some(kit), None),
+            Source::Capsule(c) => fill_from_image(&work, &new, &c.image, None, Some(c)),
             Source::Template(name) => fill_from_template(&work, &new, name),
         }?;
         make_ext4(&work.join("rwlayer.img"), LAYER_SIZE, "rwlayer")?;
@@ -269,25 +288,37 @@ fn fill_from_copy(work: &Path, new: &NewBox, from: &Path) -> Result<()> {
     Ok(())
 }
 
-fn fill_from_image(work: &Path, new: &NewBox, image: &Image, kit: Option<&Kit>) -> Result<()> {
+fn fill_from_image(work: &Path, new: &NewBox, image: &Image, kit: Option<&Kit>, capsule: Option<&CapsuleLaunch>) -> Result<()> {
     let mut spec: Value = serde_json::from_str(BASE_SPEC)?;
     spec["hostname"] = new.name.clone().into();
     spec["linux"]["cgroupsPath"] = format!("/elpis/{}", new.name).into();
     spec["annotations"][CPU] = new.cpus.unwrap_or(4).to_string().into();
     spec["annotations"][MEMORY] = new.memory_mb.unwrap_or(4096).to_string().into();
 
-    let (user, uid, gid) = image.user_ids();
-    let workspace = new.workspace.as_ref().map(|w| (w.clone(), guest_path(w)));
+    // A Capsule names the user it runs as; that user has to exist in the image
+    let (user, uid, gid) = match capsule.and_then(|c| c.capsule.spec.runtime.user.as_deref()) {
+        Some(name) => image.users().into_iter().find(|(n, ..)| n == name).with_context(|| {
+            let known: Vec<String> = image.users().into_iter().map(|u| u.0).collect();
+            format!("the Capsule runs as {name:?}, which isn't in the image's /etc/passwd (it has: {})", known.join(", "))
+        })?,
+        None => image.user_ids(),
+    };
+    // A Capsule says where its workspace appears (and whether it is read-only); a kit or image gets sbx's path
+    let capsule_ws = capsule.and_then(|c| c.capsule.spec.interfaces.workspace.as_ref());
+    if new.workspace.is_some() && capsule.is_some() && capsule_ws.is_none() {
+        bail!("this Capsule doesn't declare a workspace (spec.interfaces.workspace), so it can't share a folder");
+    }
+    let workspace = new.workspace.as_ref().map(|w| (w.clone(), capsule_ws.map_or_else(|| guest_path(w), |ws| ws.path.clone())));
+    let workspace_ro = capsule_ws.is_some_and(|ws| ws.access.as_deref() == Some("ro"));
     let mut env = image.config.env.clone();
-    if let Some(kit) = kit {
-        for (k, v) in &kit.environment.variables {
-            env.retain(|e| !e.starts_with(&format!("{k}=")));
-            env.push(format!("{k}={v}"));
-        }
+    let overrides = kit.map(|k| &k.environment.variables).into_iter().chain(capsule.map(|c| c.capsule.env()));
+    for (k, v) in overrides.flatten() {
+        env.retain(|e| !e.starts_with(&format!("{k}=")));
+        env.push(format!("{k}={v}"));
     }
     if let Some((host, guest)) = &workspace {
         env.push(format!("WORKSPACE_DIR={guest}"));
-        let binds = json!([{ "guestSubpath": guest, "readOnly": false, "source": host.to_string_lossy(), "target": guest }]);
+        let binds = json!([{ "guestSubpath": guest, "readOnly": workspace_ro, "source": host.to_string_lossy(), "target": guest }]);
         spec["annotations"][POLICYBINDS] = Value::String(binds.to_string());
     }
     let process = &mut spec["process"];
@@ -302,8 +333,10 @@ fn fill_from_image(work: &Path, new: &NewBox, image: &Image, kit: Option<&Kit>) 
     process["args"] = json!(["sh", "-c", "command -v tini >/dev/null 2>&1 && exec tini -s -- sleep infinity; exec sleep infinity"]);
     write_spec(work, &spec)?;
 
-    let lowers: Vec<Value> =
-        image.layers.iter().rev().map(|l| json!({ "type": "erofs", "source": l.to_string_lossy(), "options": ["ro", "loop"] })).collect();
+    let layer = |l: &Path| json!({ "type": "erofs", "source": l.to_string_lossy(), "options": ["ro", "loop"] });
+    let mut lowers: Vec<Value> = image.layers.iter().rev().map(|l| layer(l)).collect();
+    // lowest, so the image's own directories keep their owners (see CapsuleLaunch::payload_layer)
+    lowers.extend(capsule.and_then(|c| c.payload_layer.as_deref()).map(layer));
     write_rootfs(work, &lowers)?;
 
     let entrypoint = match kit {
@@ -332,6 +365,11 @@ fn fill_from_image(work: &Path, new: &NewBox, image: &Image, kit: Option<&Kit>) 
         ports: Vec::new(), // added in finish_disks
         auto_stop: None,
     };
+    // A Capsule supplies the rest (what to run, setup steps, volumes); the image and workspace facts stay ours
+    let file = match capsule {
+        Some(c) => BoxFile { users: file.users, user_name: file.user_name, workspace: file.workspace, image: file.image, ..c.capsule.to_boxfile(&[])? },
+        None => file,
+    };
     file.save(work)?;
 
     // The kit's domains become allow rules; flip the default to deny to enforce just those
@@ -340,6 +378,26 @@ fn fill_from_image(work: &Path, new: &NewBox, image: &Image, kit: Option<&Kit>) 
         for pattern in &kit.permissions.network.allow {
             let _ = policy.add(pattern, Action::Allow);
         }
+    }
+    // A Capsule's grants are the whole of its network access: deny by default, allow what was granted. Host
+    // access is a rule that names the host, as policy.rs requires.
+    if let Some(c) = capsule {
+        let policy = Policy::load(work);
+        policy.set_default(Action::Deny)?;
+        for pattern in &c.grants.network {
+            policy.add(pattern, Action::Allow).with_context(|| format!("granting network access to {pattern}"))?;
+        }
+        if c.grants.host_access {
+            policy.add("host.docker.internal", Action::Allow)?;
+        }
+        Lock {
+            capsule: c.capsule.reference(),
+            digest: c.digest.clone(),
+            requests: c.capsule.spec.requests.clone(),
+            granted: c.grants.clone(),
+            credentials_ignored: c.capsule.spec.requests.credentials.iter().map(|r| r.service.clone()).collect(),
+        }
+        .save(work)?;
     }
     Ok(())
 }
@@ -367,6 +425,8 @@ fn finish_disks(work: &Path, new: &NewBox) -> Result<()> {
     mounts.retain(|m| m["type"] != "ext4");
     let wanted = new.docker.unwrap_or(match &new.source {
         Source::Image(image) | Source::Kit(_, image) => image.wants_docker(),
+        // the Capsule says whether it needs Docker; the image's label doesn't decide for it
+        Source::Capsule(c) => c.capsule.spec.resources.docker,
         Source::Copy(_) | Source::Template(_) => had,
     });
     let disk = work.join("docker.img");
@@ -665,6 +725,131 @@ pub fn shell_command(work: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DIGEST: &str = "docker.io/library/alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn launch(extra_spec: &str, grants: Grants) -> CapsuleLaunch {
+        let yaml = format!(
+            "apiVersion: elpis.dev/v1alpha1\nkind: Capsule\nmetadata: {{ name: myteam/tool, version: 1.0.0 }}\nspec:\n  runtime:\n    image: {DIGEST}\n    user: agent\n    entrypoint: [/opt/agent/run.sh]\n    env: {{ MODE: capsule }}\n    install: [{{ command: \"echo installed\" }}]\n{extra_spec}"
+        );
+        let image = Image {
+            reference: DIGEST.into(),
+            layers: vec![PathBuf::from("C:/layers/base.erofs"), PathBuf::from("C:/layers/top.erofs")],
+            passwd: "root:x:0:0::/root:/bin/sh\nagent:x:1000:1000::/home/agent:/bin/sh\n".into(),
+            ..Default::default()
+        };
+        CapsuleLaunch { capsule: Capsule::parse(&yaml).unwrap(), digest: "sha256:abc".into(), image, payload_layer: Some(PathBuf::from("C:/layers/payload.erofs")), grants }
+    }
+
+    fn temp_box(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("elpis-workdir-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(p.join("bundle")).unwrap();
+        p
+    }
+
+    fn new_box(work: &Path, workspace: Option<&str>) -> NewBox {
+        let image = Image::default();
+        NewBox { workspace: workspace.map(PathBuf::from), ..NewBox::new(work.file_name().unwrap().to_string_lossy(), Source::Image(image)) }
+    }
+
+    #[test]
+    fn a_capsule_box_has_its_grants_as_its_whole_network() {
+        let work = temp_box("grants");
+        let c = launch("", Grants { network: vec!["api.example.com".into()], host_access: true });
+        fill_from_image(&work, &new_box(&work, None), &c.image, None, Some(&c)).unwrap();
+
+        let policy = Policy::load(&work).snapshot();
+        assert_eq!(policy.default, Action::Deny);
+        let allowed: Vec<&str> = policy.rules.iter().filter(|r| r.action == Action::Allow).map(|r| r.pattern.as_str()).collect();
+        assert_eq!(allowed, ["api.example.com", "host.docker.internal"]);
+
+        let lock = Lock::load(&work).unwrap();
+        assert_eq!((lock.capsule.as_str(), lock.digest.as_str()), ("myteam/tool@1.0.0", "sha256:abc"));
+        assert_eq!(lock.granted, c.grants);
+    }
+
+    #[test]
+    fn nothing_requested_means_nothing_granted() {
+        let work = temp_box("none");
+        let c = launch("", Grants::default());
+        fill_from_image(&work, &new_box(&work, None), &c.image, None, Some(&c)).unwrap();
+        let policy = Policy::load(&work).snapshot();
+        assert_eq!(policy.default, Action::Deny);
+        assert!(policy.rules.is_empty());
+    }
+
+    #[test]
+    fn the_payload_layer_goes_under_the_images_layers() {
+        let work = temp_box("layers");
+        let c = launch("", Grants::default());
+        fill_from_image(&work, &new_box(&work, None), &c.image, None, Some(&c)).unwrap();
+        let mounts: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(work.join("rootfs.json")).unwrap()).unwrap();
+        let sources: Vec<&str> = mounts.iter().map(|m| m["source"].as_str().unwrap()).collect();
+        // writable layer, then top-first: the image's layers, the payload last, then the overlay
+        assert_eq!(&sources[1..4], ["C:/layers/top.erofs", "C:/layers/base.erofs", "C:/layers/payload.erofs"]);
+        assert!(mounts[4]["options"].as_array().unwrap().iter().any(|o| o == "lowerdir={{ overlay 1 3 }}"));
+    }
+
+    #[test]
+    fn box_json_comes_from_the_capsule_and_the_image() {
+        let work = temp_box("boxjson");
+        let c = launch("  resources: { autoStop: 90 }\n", Grants::default());
+        fill_from_image(&work, &new_box(&work, None), &c.image, None, Some(&c)).unwrap();
+        let file = BoxFile::load(&work).unwrap();
+        assert_eq!(file.source, "capsule myteam/tool@1.0.0");
+        assert_eq!(file.entrypoint, ["/opt/agent/run.sh"]);
+        assert_eq!(file.user_name.as_deref(), Some("agent"));
+        assert_eq!(file.users["agent"], (1000, 1000));
+        assert_eq!(file.image.as_deref(), Some(DIGEST));
+        assert_eq!(file.install[0].argv, ["sh", "-c", "echo installed"]);
+        assert_eq!(file.auto_stop, Some(90));
+        assert!(file.workspace.is_none() && !file.installed);
+
+        let spec = read_spec(&work).unwrap();
+        assert_eq!(spec["process"]["user"]["uid"], 1000);
+        assert!(spec["process"]["env"].as_array().unwrap().iter().any(|e| e == "MODE=capsule"));
+    }
+
+    #[test]
+    fn the_capsule_chooses_where_the_workspace_appears() {
+        let work = temp_box("ws");
+        let c = launch("  interfaces:\n    workspace: { path: /work, access: ro }\n", Grants::default());
+        fill_from_image(&work, &new_box(&work, Some(r"C:\code\app")), &c.image, None, Some(&c)).unwrap();
+        let spec = read_spec(&work).unwrap();
+        let binds: Vec<Value> = serde_json::from_str(spec["annotations"][POLICYBINDS].as_str().unwrap()).unwrap();
+        assert_eq!((binds[0]["target"].as_str(), binds[0]["readOnly"].as_bool()), (Some("/work"), Some(true)));
+        assert_eq!(binds[0]["source"], r"C:\code\app");
+        assert_eq!(BoxFile::load(&work).unwrap().workspace.as_deref(), Some("/work"));
+        assert_eq!(spec["process"]["cwd"], "/work");
+    }
+
+    #[test]
+    fn a_folder_for_a_capsule_without_a_workspace_is_refused() {
+        let work = temp_box("nows");
+        let c = launch("", Grants::default());
+        let e = fill_from_image(&work, &new_box(&work, Some(r"C:\code\app")), &c.image, None, Some(&c)).unwrap_err().to_string();
+        assert!(e.contains("doesn't declare a workspace"), "{e}");
+    }
+
+    #[test]
+    fn the_capsules_user_must_exist_in_the_image() {
+        let work = temp_box("nouser");
+        let mut c = launch("", Grants::default());
+        c.capsule.spec.runtime.user = Some("builder".into());
+        let e = fill_from_image(&work, &new_box(&work, None), &c.image, None, Some(&c)).unwrap_err().to_string();
+        assert!(e.contains("builder") && e.contains("agent"), "{e}");
+    }
+
+    #[test]
+    fn a_capsule_without_a_payload_adds_no_layer() {
+        let work = temp_box("nopayload");
+        let mut c = launch("", Grants::default());
+        c.payload_layer = None;
+        fill_from_image(&work, &new_box(&work, None), &c.image, None, Some(&c)).unwrap();
+        let mounts: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(work.join("rootfs.json")).unwrap()).unwrap();
+        assert_eq!(mounts.len(), 4); // writable, two image layers, overlay
+    }
 
     #[test]
     fn guest_paths() {

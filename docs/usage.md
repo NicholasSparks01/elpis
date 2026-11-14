@@ -96,10 +96,11 @@ A template freezes a stopped box's writable layer as a read-only layer on top of
 
 ## Capsules (preview)
 
-A **Capsule** is a portable description of an agent: image, start command, files, and what it asks for (network, credentials). It is not a VM snapshot, so it carries no tokens or state. The manifest is described in [Capsule manifest](capsule-manifest.md). For now you can build, inspect and list Capsules locally; running, publishing and signing aren't implemented yet.
+A **Capsule** is a portable description of an agent: image, start command, files, and what it asks for (network, credentials). It is not a VM snapshot, so it carries no tokens or state. The manifest is described in [Capsule manifest](capsule-manifest.md). For now you can build, inspect, list and run Capsules locally; publishing, pulling and signing aren't implemented yet.
 
 | Task | Command |
 |---|---|
+| Run it in a new box | `capsule run NAME[@VERSION] [DIR] [--yes] [-p HOST:BOX]` |
 | Validate a folder and store it as `NAME@VERSION` | `capsule build [DIR]` |
 | Replace a version built with different content | `capsule build DIR --force` |
 | Show what it runs and asks for | `capsule inspect NAME[@VERSION]` or `capsule inspect DIR` (`--json` prints the manifest) |
@@ -107,6 +108,10 @@ A **Capsule** is a portable description of an agent: image, start command, files
 | Remove one version | `capsule rm NAME@VERSION` |
 
 `build` refuses a manifest whose image isn't pinned by digest, and a payload that holds an obvious secret, leads outside the folder, or contains a symbolic link. Payload folders skip `.git`. Files ending in `.sh` or starting with `#!` become executable in the box, since Windows has no executable bit to read; everything else is read-only (0644) and owned by root. The same files always produce the same digest. A built version is immutable: rebuilding it with changed content fails unless you pass `--force`, so bump `metadata.version` instead.
+
+`capsule run` verifies the stored Capsule, prints what it asks for and waits for a yes (`--yes` accepts everything it asks for), pulls its image, and makes a box named `CAPSULE-FOLDER` (or `--name`) whose network policy is default `deny` plus an allow rule for each granted host. It then opens the agent, as `run` does. If the box already exists from the same build it is reused; from a different build, or not from a Capsule, it stops and tells you. A Capsule with a workspace shares `DIR` (default: the current folder) at the path and access it declares; one without refuses a folder. `-p` publishes only ports the Capsule declares. `capsule.lock` in the box folder records what was requested and granted.
+
+The payload is a read-only layer *under* the image's own layers, so the image's directories keep their owners. A file the image already has at a payload path wins over the payload's. Credential requests aren't injected yet: the agent signs in itself. Run uses the same VM path as `run` and `create`, which CI can't boot, so check it on a real box (see CLAUDE.md).
 
 ## Docker inside the box
 

@@ -37,6 +37,7 @@ Set these in the environment of the program you run (`elpis-run`, `elpis-tui`, `
 | `kits\` | Cached kit specs |
 | `templates\` | Saved templates |
 | `capsules\NAMESPACE\NAME\VERSION\` | Built Capsules: `capsule.yaml` as written, `payload.tar.gz`, and `build.json` with the digests |
+| `capsules\.layers\` | Payloads converted to erofs layers by `capsule run`, shared by boxes from the same build |
 | `proxy\` | The credential proxy's CA (`ca.pem`, `ca.key.pem`) |
 
 Moving the whole folder is safe while no box is running; point `ELPIS_HOME` at the new place.
@@ -50,6 +51,7 @@ Moving the whole folder is safe while no box is running; point `ELPIS_HOME` at t
 | `rwlayer.img` | The writable layer: sparse ext4 with a journal |
 | `box.json` | Where the box came from (kit, image, template), the agent command, workspace, Docker, ports, auto-stop, kit setup steps |
 | `network-policy.json` | Egress policy (created on first use) |
+| `capsule.lock` | Boxes made by `capsule run`: the Capsule and digest, what it requested, and what was granted |
 | `docker.img` | Docker's disk at `/var/lib/docker`, for boxes with Docker |
 | `vol-N.img` | Sized volumes a kit asks for |
 | `net.sock`, `sockets\` | The NIC socket and host-port sockets, while running |

@@ -1,6 +1,6 @@
 # Capsule manifest (proposal)
 
-> **Status: draft.** The manifest types and validation (`crates/elpis/src/capsule.rs`) and the local store behind `elpis-run capsule build|inspect|ls|rm` (`capsulestore.rs`, see [Usage](usage.md#capsules-preview)) exist. Running a Capsule, `mcp` and `bindings` at run time, registries, and signing do not. This describes "Capsules": portable, versioned packages of an agent implementation (not a VM snapshot) that each user instantiates as their own box.
+> **Status: draft.** The manifest types and validation (`crates/elpis/src/capsule.rs`), the local store, and `elpis-run capsule build|inspect|ls|rm|run` (`capsulestore.rs`, see [Usage](usage.md#capsules-preview)) exist. `run` applies the runtime, payload, workspace, ports, volumes, Docker, network grants and host access. `mcp`, `bindings`, credential injection, `tests`, registries and signing are not applied yet. This describes "Capsules": portable, versioned packages of an agent implementation (not a VM snapshot) that each user instantiates as their own box.
 >
 > Payload files are packed owned by root with mode 0644 (0755 for `.sh` and `#!` files), so an agent running as a non-root `runtime.user` can read them but not modify them. Whether the manifest needs an `owner` or writable-path option is an open decision.
 

@@ -581,7 +581,48 @@ impl Capsule {
     }
 }
 
+/// What the consumer allowed. Today that is network hosts and access to the Windows host; credential requests
+/// aren't injected yet (the proxy's spec is richer than a Capsule's), so they are never granted.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Grants {
+    pub network: Vec<String>,
+    pub host_access: bool,
+}
+
+/// `capsule.lock` in a box folder: which Capsule made the box, what it asked for, and what was granted.
+/// A later version's requests are compared with `requests` to decide what needs approving again.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Lock {
+    pub capsule: String,
+    pub digest: String,
+    pub requests: Requests,
+    pub granted: Grants,
+    /// Credential services the Capsule asked for that were not injected
+    pub credentials_ignored: Vec<String>,
+}
+
+impl Lock {
+    pub fn path_for(work: &Path) -> std::path::PathBuf {
+        work.join("capsule.lock")
+    }
+
+    pub fn load(work: &Path) -> Option<Lock> {
+        serde_json::from_slice(&std::fs::read(Lock::path_for(work)).ok()?).ok()
+    }
+
+    pub fn save(&self, work: &Path) -> Result<()> {
+        std::fs::write(Lock::path_for(work), serde_json::to_vec_pretty(self)?).context("writing capsule.lock")
+    }
+}
+
 impl Requests {
+    /// Everything this asks for that can be granted today (what `--yes` accepts).
+    pub fn grantable(&self) -> Grants {
+        Grants { network: self.network.allow.clone(), host_access: self.host_access }
+    }
+
     /// What `self` asks for that `previous` didn't: the lines a consent prompt shows when a new version
     /// widens the Capsule's reach. Empty means nothing new needs approval.
     pub fn added_since(&self, previous: &Requests) -> Vec<String> {
@@ -998,6 +1039,28 @@ spec:
             assert!(s.contains(want), "missing {want:?} in:\n{s}");
         }
         assert!(!s.contains("hunter2"));
+    }
+
+    #[test]
+    fn grantable_is_the_network_and_host_access_only() {
+        let mut req = Capsule::parse(&manifest()).unwrap().spec.requests;
+        req.host_access = true;
+        let g = req.grantable();
+        assert_eq!(g.network, ["api.anthropic.com", "*.npmjs.org"]);
+        assert!(g.host_access);
+    }
+
+    #[test]
+    fn the_lock_round_trips_and_rejects_unknown_fields() {
+        let dir = std::env::temp_dir().join(format!("elpis-lock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let requests = Capsule::parse(&manifest()).unwrap().spec.requests;
+        let lock = Lock { capsule: "a/b@1.0.0".into(), digest: "sha256:x".into(), granted: requests.grantable(), requests, credentials_ignored: vec!["anthropic".into()] };
+        lock.save(&dir).unwrap();
+        let back = Lock::load(&dir).unwrap();
+        assert_eq!((back.capsule, back.granted, back.credentials_ignored), (lock.capsule, lock.granted, lock.credentials_ignored));
+        std::fs::write(Lock::path_for(&dir), r#"{"capsule":"a/b@1.0.0","bogus":1}"#).unwrap();
+        assert!(Lock::load(&dir).is_none());
     }
 
     #[test]

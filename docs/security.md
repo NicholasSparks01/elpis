@@ -32,6 +32,7 @@ Elpis exists to let coding agents run with broad freedom inside a box while limi
 - **Templates and box folders hold whatever the box held**, including tokens from signing in inside an agent.
 - **Elpis's own processes run as you.** They are not sandboxed; a vulnerability in the shim's device emulation or in the engine's handling of guest data (network frames, ttrpc messages, stream data) would run code with your rights. Keep the build current.
 - **Images and kits from registries** are pulled over TLS and verified by digest, but their content is only as trustworthy as their publisher.
+- **Capsules ask; you grant.** `capsule run` shows what a Capsule requests (network hosts, access to the Windows host) and creates the box only after you approve (or pass `--yes`). The box's network policy is then default `deny` plus an allow rule per granted host, which is stricter than the usual `allow` default. A Capsule's credential requests are not injected yet, and `capsule.lock` in the box folder records what was requested and granted. The Capsule's own code (its install and startup steps, and its payload) still runs inside the box with whatever you granted, so read what you run.
 - **Docker Sandboxes compatibility mode** (`--shim sbx`) runs Docker's shim instead; its isolation is Docker's.
 
 ## Not in scope

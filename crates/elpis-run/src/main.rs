@@ -201,6 +201,34 @@ enum SecretAction {
     Rm { service: String },
 }
 
+#[derive(Args)]
+struct CapsuleRunArgs {
+    /// NAME or NAME@VERSION of a built Capsule
+    reference: String,
+    /// Folder to share as the workspace [default: the current folder, for a Capsule that has a workspace]
+    workspace: Option<PathBuf>,
+    /// Box name [default: CAPSULE-FOLDER]
+    #[arg(long)]
+    name: Option<String>,
+    /// Grant everything the Capsule asks for without asking
+    #[arg(long)]
+    yes: bool,
+    /// Open a shell instead of the agent
+    #[arg(long)]
+    shell: bool,
+    #[arg(long)]
+    cpus: Option<u32>,
+    /// Memory in MB
+    #[arg(long)]
+    memory: Option<u64>,
+    /// Publish a port the Capsule declares to Windows: [IP:]HOST:BOX, e.g. 8080:3000 (repeatable)
+    #[arg(short = 'p', long = "publish", value_name = "[IP:]HOST:BOX")]
+    publish: Vec<String>,
+    /// Stop the box this many seconds after its last terminal closes; 0 keeps it running [default: the Capsule's]
+    #[arg(long, value_name = "SECONDS")]
+    auto_stop: Option<u64>,
+}
+
 #[derive(Subcommand)]
 enum CapsuleAction {
     /// Validate a Capsule folder and store it as NAME@VERSION (a version is immutable)
@@ -222,6 +250,8 @@ enum CapsuleAction {
     /// List built Capsules
     #[command(alias = "list")]
     Ls,
+    /// Make a box from a built Capsule (asking what to grant it) and open its agent
+    Run(CapsuleRunArgs),
     /// Remove one built version (NAME@VERSION)
     Rm { reference: String },
 }
@@ -345,7 +375,7 @@ fn main() {
                 0
             }),
             Some(Command::Template { action }) => template(action),
-            Some(Command::Capsule { action }) => capsule(action),
+            Some(Command::Capsule { action }) => capsule(action, &log).await,
             Some(Command::Secret { action }) => secret(action),
             Some(Command::Ports { r#box, publish, unpublish }) => ports(&r#box, &publish, &unpublish),
             Some(Command::Exec(args)) => exec(args).await,
@@ -801,11 +831,12 @@ fn template(action: TemplateAction) -> Result<i32> {
     Ok(0)
 }
 
-fn capsule(action: CapsuleAction) -> Result<i32> {
+async fn capsule(action: CapsuleAction, log: &Log) -> Result<i32> {
     use elpis::capsule::Capsule;
     use elpis::capsulestore::{Store, short};
     let store = Store::open();
     match action {
+        CapsuleAction::Run(args) => return capsule_run(args, log).await,
         CapsuleAction::Build { dir, force } => {
             let b = store.build(&dir, force)?;
             println!("built {}", b.reference());
@@ -841,6 +872,102 @@ fn capsule(action: CapsuleAction) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// A box name from the parts: letters, digits and hyphens, at most 40 characters.
+fn box_name(parts: &[&str]) -> String {
+    let joined: String = parts.join("-").chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    joined.chars().take(40).collect::<String>().trim_matches('-').to_owned()
+}
+
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+/// Run a built Capsule: verify it, show what it asks for and ask what to grant, pull its image, make a box
+/// whose network policy is exactly the grants, and open the agent. An existing box from the same build is reused.
+async fn capsule_run(args: CapsuleRunArgs, log: &Log) -> Result<i32> {
+    use elpis::capsule::Lock;
+    use elpis::capsulestore::Store;
+    use elpis::workdir::CapsuleLaunch;
+
+    let store = Store::open();
+    let built = store.find(&args.reference)?;
+    let capsule = store.load(&built)?; // checks the stored files still match the build
+    if !capsule.compatible_with(env!("CARGO_PKG_VERSION"))? {
+        anyhow::bail!("{} needs a newer Elpis ({})", capsule.reference(), capsule.spec.compatibility.elpis.as_deref().unwrap_or_default());
+    }
+
+    let workspace = match (&args.workspace, capsule.spec.interfaces.workspace.is_some()) {
+        (Some(w), true) => Some(std::path::absolute(w)?),
+        (None, true) => Some(std::env::current_dir()?),
+        (Some(_), false) => anyhow::bail!("{} doesn't declare a workspace, so there is no folder to share; leave the folder out", capsule.reference()),
+        (None, false) => None,
+    };
+    let short = capsule.metadata.name.rsplit('/').next().unwrap_or(&capsule.metadata.name).to_owned();
+    let folder = workspace.as_ref().and_then(|w| w.file_name()).map(|f| f.to_string_lossy().into_owned());
+    let name = args.name.clone().unwrap_or_else(|| box_name(&[&short, folder.as_deref().unwrap_or("")]));
+    if name.is_empty() {
+        anyhow::bail!("couldn't make a box name; pass --name");
+    }
+
+    let work = debug_root().join(&name);
+    if work.join(r"bundle\config.json").exists() {
+        return match Lock::load(&work) {
+            Some(lock) if lock.digest == built.digest => {
+                println!("using box {name} ({})", lock.capsule);
+                start_and_open(&work, args.shell, log).await
+            }
+            Some(lock) => anyhow::bail!("box {name} was made from {} with different content; `elpis-run rm {name}` it, or pass --name", lock.capsule),
+            None => anyhow::bail!("a box named {name} already exists and wasn't made from a Capsule; pass --name"),
+        };
+    }
+
+    let ports = args.publish.iter().map(|p| PortMap::parse(p)).collect::<Result<Vec<_>>>()?;
+    capsule.to_boxfile(&ports)?; // a published port has to be one the Capsule declares; fail before asking anything
+
+    // Requests are not grants: show what would be granted, and nothing is created until it's approved
+    let requests = &capsule.spec.requests;
+    let grants = requests.grantable();
+    println!("{} asks for:", capsule.reference());
+    if grants.network.is_empty() {
+        println!("  network   none (the box will be offline)");
+    } else {
+        println!("  network   {}", grants.network.join(", "));
+    }
+    if grants.host_access {
+        println!("  host      access to this Windows machine's services");
+    }
+    if !requests.credentials.is_empty() {
+        let services: Vec<&str> = requests.credentials.iter().map(|c| c.service.as_str()).collect();
+        println!("  credentials requested ({}) are not injected yet; the agent has to sign in itself", services.join(", "));
+    }
+    if !args.yes && !confirm("Grant these?")? {
+        anyhow::bail!("not granted; nothing was created");
+    }
+
+    let image_ref = capsule.spec.runtime.image.clone();
+    let image = tokio::task::spawn_blocking(move || elpis::registry::pull(&image_ref, &progress)).await??;
+    let payload_layer = {
+        let built = built.clone();
+        tokio::task::spawn_blocking(move || Store::open().payload_layer(&built)).await??
+    };
+
+    println!("creating box {name} from {}", capsule.reference());
+    let launch = CapsuleLaunch { capsule, digest: built.digest.clone(), image, payload_layer, grants };
+    let new = NewBox { workspace, cpus: args.cpus, memory_mb: args.memory, ports, ..NewBox::new(name.clone(), Source::Capsule(Box::new(launch))) };
+    let work = tokio::task::spawn_blocking(move || workdir::create_box(new)).await??;
+    if let Some(secs) = args.auto_stop {
+        let mut file = BoxFile::load_or_default(&work);
+        file.auto_stop = Some(secs);
+        file.save(&work)?;
+    }
+    start_and_open(&work, args.shell, log).await
 }
 
 fn ports(name: &str, publish: &[String], unpublish: &[u16]) -> Result<i32> {
