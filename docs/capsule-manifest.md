@@ -1,6 +1,6 @@
 # Capsule manifest (proposal)
 
-> **Status: draft.** The manifest types and validation (`crates/elpis/src/capsule.rs`), the local store, and `elpis-run capsule build|inspect|ls|rm|run` (`capsulestore.rs`, see [Usage](usage.md#capsules-preview)) exist. `run` applies the runtime, payload, workspace, ports, volumes, Docker, network grants and host access. `mcp`, `bindings`, credential injection, `tests`, registries and signing are not applied yet. This describes "Capsules": portable, versioned packages of an agent implementation (not a VM snapshot) that each user instantiates as their own box.
+> **Status: draft.** The manifest types and validation (`crates/elpis/src/capsule.rs`), the local store, and `elpis-run capsule build|inspect|ls|rm|run|push|pull` (`capsulestore.rs`, `capsuleremote.rs`, see [Usage](usage.md#capsules-preview)) exist. `run` applies the runtime, payload, workspace, ports, volumes, Docker, network grants and host access. `mcp`, `bindings`, credential injection, `tests`, registries and signing are not applied yet. This describes "Capsules": portable, versioned packages of an agent implementation (not a VM snapshot) that each user instantiates as their own box.
 >
 > Payload files are packed owned by root with mode 0644 (0755 for `.sh` and `#!` files), so an agent running as a non-root `runtime.user` can read them but not modify them. Whether the manifest needs an `owner` or writable-path option is an open decision.
 
@@ -96,6 +96,10 @@ spec:
 - **`requests.credentials[].inject` is a capability, not metadata.** It decides which hosts receive the user's key. The consent prompt must show these hosts, and a new version that adds one must re-prompt.
 - **Independence from sbx.** The kit structs follow sbx's public spec. Capsule field names deliberately differ, and the Capsule must use its own `elpis.*` media type, not the sbx kit media type. Kit compatibility, if wanted, is a one-way `capsule import-kit` converter, not a superset schema.
 - **Secrets.** `build` should scan `env`, `payload` and inline files for obvious key patterns and fail; "credentials stay external" shouldn't rest on convention alone.
+
+## Registry format
+
+A Capsule is an OCI image manifest with `artifactType` `application/vnd.elpis.capsule.v1`. Its config blob (`application/vnd.elpis.capsule.config.v1+yaml`) is `capsule.yaml` as written, and its one layer (`application/vnd.elpis.capsule.payload.v1.tar+gzip`) is the payload, or the standard OCI empty layer when there is none. The repository is `REGISTRY[/PREFIX]/NAMESPACE/NAME` and the tag is `metadata.version`; the manifest also carries the Capsule's own digest as the annotation `dev.elpis.capsule.digest`. These media types are Elpis's own, not sbx's kit type.
 
 ## Open decisions
 

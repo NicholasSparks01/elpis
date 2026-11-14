@@ -240,18 +240,38 @@ enum CapsuleAction {
         #[arg(long)]
         force: bool,
     },
-    /// Show what a Capsule runs and what it asks for: a built NAME[@VERSION], or a folder
+    /// Show what a Capsule runs and what it asks for: a built NAME[@VERSION], a folder, or with --remote a registry reference
     Inspect {
         target: String,
         /// Print the manifest as JSON
         #[arg(long)]
         json: bool,
+        /// TARGET is REGISTRY/NAMESPACE/NAME:VERSION; reads only the manifest, not the payload
+        #[arg(long)]
+        remote: bool,
     },
     /// List built Capsules
     #[command(alias = "list")]
     Ls,
     /// Make a box from a built Capsule (asking what to grant it) and open its agent
     Run(CapsuleRunArgs),
+    /// Upload a built Capsule to an OCI registry as REGISTRY[/PREFIX]/NAMESPACE/NAME:VERSION
+    Push {
+        /// NAME@VERSION of a built Capsule
+        reference: String,
+        /// Registry, with an optional path: registry.example.com or registry.example.com/team
+        to: String,
+        /// Overwrite a release that exists with different content
+        #[arg(long)]
+        force: bool,
+    },
+    /// Download a Capsule from a registry into the local store (REGISTRY/NAMESPACE/NAME:VERSION, or @sha256:… to pin)
+    Pull {
+        reference: String,
+        /// Replace a stored version that has different content
+        #[arg(long)]
+        force: bool,
+    },
     /// Remove one built version (NAME@VERSION)
     Rm { reference: String },
 }
@@ -846,7 +866,30 @@ async fn capsule(action: CapsuleAction, log: &Log) -> Result<i32> {
             }
             println!("  stored   {}", b.path.display());
         }
-        CapsuleAction::Inspect { target, json } => {
+        CapsuleAction::Push { reference, to, force } => {
+            let spec = reference.clone();
+            let pushed = tokio::task::spawn_blocking(move || elpis::capsuleremote::push(&Store::open(), &spec, &to, force, &progress)).await??;
+            println!("{} {}", if pushed.uploaded { "pushed" } else { "already there:" }, pushed.reference);
+            println!("  digest   {}", pushed.digest);
+            println!("  pin it:  elpis-run capsule pull {}@{}", pushed.reference.rsplit_once(':').map_or(pushed.reference.as_str(), |(r, _)| r), pushed.digest);
+            println!("  Capsules aren't signed yet: anyone who can write this tag can replace it, so share the pinned form.");
+        }
+        CapsuleAction::Pull { reference, force } => {
+            let built = tokio::task::spawn_blocking(move || elpis::capsuleremote::pull(&Store::open(), &reference, force, &progress)).await??;
+            println!("pulled {}", built.reference());
+            println!("  digest   {}", short(&built.digest));
+            println!("  stored   {}", built.path.display());
+            println!("  nothing runs until you `capsule run` it, and that asks what to grant; `capsule inspect {}` shows what it asks for", built.reference());
+        }
+        CapsuleAction::Inspect { target, json, remote: true } => {
+            let (capsule, digest) = tokio::task::spawn_blocking(move || elpis::capsuleremote::inspect(&target)).await??;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&capsule)?);
+            } else {
+                print!("{}", capsule.summary(Some(&format!("registry manifest {digest}"))));
+            }
+        }
+        CapsuleAction::Inspect { target, json, remote: false } => {
             // a folder or capsule.yaml on disk, else a built Capsule
             let on_disk = Path::new(&target);
             let (capsule, digest) = if on_disk.join("capsule.yaml").is_file() || on_disk.is_file() {
@@ -863,7 +906,7 @@ async fn capsule(action: CapsuleAction, log: &Log) -> Result<i32> {
         }
         CapsuleAction::Ls => {
             for b in store.list() {
-                println!("  {:<36} {}  {:>3} file(s)  {}", b.reference(), short(&b.digest), b.payload_files, b.description);
+                println!("  {:<36} {}  {:>3} file(s)  {}{}", b.reference(), short(&b.digest), b.payload_files, b.description, b.origin.as_ref().map_or(String::new(), |o| format!("  (from {o})")));
             }
         }
         CapsuleAction::Rm { reference } => {

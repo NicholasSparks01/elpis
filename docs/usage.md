@@ -96,11 +96,14 @@ A template freezes a stopped box's writable layer as a read-only layer on top of
 
 ## Capsules (preview)
 
-A **Capsule** is a portable description of an agent: image, start command, files, and what it asks for (network, credentials). It is not a VM snapshot, so it carries no tokens or state. The manifest is described in [Capsule manifest](capsule-manifest.md). For now you can build, inspect, list and run Capsules locally; publishing, pulling and signing aren't implemented yet.
+A **Capsule** is a portable description of an agent: image, start command, files, and what it asks for (network, credentials). It is not a VM snapshot, so it carries no tokens or state. The manifest is described in [Capsule manifest](capsule-manifest.md). You can build, inspect, list, run, push and pull Capsules; signing and a team catalog (search, fork) aren't implemented yet.
 
 | Task | Command |
 |---|---|
 | Run it in a new box | `capsule run NAME[@VERSION] [DIR] [--yes] [-p HOST:BOX]` |
+| Upload to a registry | `capsule push NAME@VERSION REGISTRY[/PREFIX] [--force]` |
+| Download from a registry | `capsule pull REGISTRY/NAMESPACE/NAME:VERSION [--force]` (`@sha256:…` instead of `:VERSION` pins it) |
+| Look before pulling | `capsule inspect --remote REGISTRY/NAMESPACE/NAME:VERSION` |
 | Validate a folder and store it as `NAME@VERSION` | `capsule build [DIR]` |
 | Replace a version built with different content | `capsule build DIR --force` |
 | Show what it runs and asks for | `capsule inspect NAME[@VERSION]` or `capsule inspect DIR` (`--json` prints the manifest) |
@@ -110,6 +113,14 @@ A **Capsule** is a portable description of an agent: image, start command, files
 `build` refuses a manifest whose image isn't pinned by digest, and a payload that holds an obvious secret, leads outside the folder, or contains a symbolic link. Payload folders skip `.git`. Files ending in `.sh` or starting with `#!` become executable in the box, since Windows has no executable bit to read; everything else is read-only (0644) and owned by root. The same files always produce the same digest. A built version is immutable: rebuilding it with changed content fails unless you pass `--force`, so bump `metadata.version` instead.
 
 `capsule run` verifies the stored Capsule, prints what it asks for and waits for a yes (`--yes` accepts everything it asks for), pulls its image, and makes a box named `CAPSULE-FOLDER` (or `--name`) whose network policy is default `deny` plus an allow rule for each granted host. It then opens the agent, as `run` does. If the box already exists from the same build it is reused; from a different build, or not from a Capsule, it stops and tells you. A Capsule with a workspace shares `DIR` (default: the current folder) at the path and access it declares; one without refuses a folder. `-p` publishes only ports the Capsule declares. `capsule.lock` in the box folder records what was requested and granted.
+
+### Sharing through a registry
+
+Any OCI registry holds Capsules (Docker Hub, GitHub Container Registry, a private one). `capsule push mytest/demo@0.1.0 registry.example.com/team` stores `registry.example.com/team/mytest/demo:0.1.0`: the manifest and the payload, byte for byte, so the digest after `capsule pull` is the one you built. The tag is the version; pushing the same content again does nothing, and pushing different content under an existing version fails unless you pass `--force`. `inspect --remote` reads only the manifest, so you can see what a Capsule asks for without downloading its payload.
+
+For a private registry, or any push, store a login (it goes only to that registry): `elpis-run secret set registry.HOST` with the value `user:password` (a token works as the password; write `:` as `_` in a host with a port, e.g. `registry.localhost_5000`). Registries on `localhost` are reached over plain HTTP; everything else needs HTTPS.
+
+Nothing is signed yet, so whoever can write a tag can replace what it holds. `push` prints the digest-pinned form; sharing and pulling `…@sha256:…` guarantees you get what was reviewed. Pull treats the registry as untrusted: the manifest is re-validated, every payload entry must be a plain file or folder inside the manifest's payload targets (no links, `..` or setuid bits), the size is capped, and all digests are recomputed. A pulled Capsule only runs through `capsule run`, which asks what to grant.
 
 The payload is a read-only layer *under* the image's own layers, so the image's directories keep their owners. A file the image already has at a payload path wins over the payload's. Credential requests aren't injected yet: the agent signs in itself. Run uses the same VM path as `run` and `create`, which CI can't boot, so check it on a real box (see CLAUDE.md).
 

@@ -25,6 +25,7 @@ pub const PAYLOAD_FILE: &str = "payload.tar.gz";
 const RECORD_FILE: &str = "build.json";
 /// A payload bigger than this is almost certainly a mistake (a `node_modules`, a disk image): fail loudly.
 const MAX_PAYLOAD_BYTES: u64 = 256 << 20;
+const MAX_PAYLOAD_ENTRIES: u64 = 100_000;
 /// Files up to this size are scanned for secrets.
 const SCAN_LIMIT: u64 = 2 << 20;
 
@@ -42,6 +43,9 @@ pub struct Built {
     pub payload_files: u64,
     /// Size of `payload.tar.gz`
     pub payload_bytes: u64,
+    /// The registry reference it was pulled from; None for a local build
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     #[serde(skip)]
     pub path: PathBuf,
 }
@@ -109,16 +113,55 @@ impl Store {
             payload_digest,
             payload_files,
             payload_bytes: payload.as_ref().map_or(0, |p| p.len() as u64),
+            origin: None,
             path: PathBuf::new(),
         };
+        self.install(built, &bytes, payload.as_deref(), force)
+    }
 
+    /// Store a Capsule that was pulled from a registry. The manifest is parsed and validated, the payload
+    /// archive is checked entry by entry (see [`validate_payload_archive`]), and both are hashed here, so
+    /// nothing the registry claimed about them is taken on trust. `origin` is the reference it came from.
+    pub fn import(&self, manifest: &[u8], payload: Option<&[u8]>, origin: &str, force: bool) -> Result<Built> {
+        let capsule = Capsule::parse(std::str::from_utf8(manifest).context("the Capsule manifest isn't UTF-8")?)?;
+        let payload_files = match (payload, capsule.spec.payload.is_empty()) {
+            (Some(gz), false) => validate_payload_archive(&capsule, gz)?,
+            (None, true) => 0,
+            (Some(_), true) => bail!("{} ships a payload its manifest doesn't declare", capsule.reference()),
+            (None, false) => bail!("{} declares a payload (spec.payload) but the registry has none", capsule.reference()),
+        };
+        let manifest_digest = sha256(manifest);
+        let payload_digest = payload.map(sha256);
+        let built = Built {
+            name: capsule.metadata.name.clone(),
+            version: capsule.metadata.version.clone(),
+            description: capsule.metadata.description.clone(),
+            digest: combined_digest(&manifest_digest, payload_digest.as_deref()),
+            manifest_digest,
+            payload_digest,
+            payload_files,
+            payload_bytes: payload.map_or(0, |p| p.len() as u64),
+            origin: Some(origin.to_owned()),
+            path: PathBuf::new(),
+        };
+        self.install(built, manifest, payload, force)
+    }
+
+    /// The manifest and payload bytes of a stored Capsule, after [`Store::load`]'s integrity check. For pushing.
+    pub fn files(&self, built: &Built) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+        self.load(built)?;
+        let payload = built.payload_path().map(|p| std::fs::read(&p).with_context(|| format!("reading {}", p.display()))).transpose()?;
+        Ok((std::fs::read(built.path.join(MANIFEST_FILE))?, payload))
+    }
+
+    fn install(&self, built: Built, manifest: &[u8], payload: Option<&[u8]>, force: bool) -> Result<Built> {
         let dest = self.version_dir(&built.name, &built.version);
         if dest.exists() {
             match read_record(&dest) {
                 Some(old) if old.digest == built.digest => return Ok(old),
                 _ if force => std::fs::remove_dir_all(&dest).with_context(|| format!("replacing {}", dest.display()))?,
                 old => bail!(
-                    "{} is already built{}; a version is immutable, so bump metadata.version, or pass --force to replace it",
+                    "{} is already in the store{}; a version is immutable, so the publisher should bump metadata.version, or pass --force to replace it",
                     built.reference(),
                     old.map_or(String::new(), |o| format!(" with different content ({})", short(&o.digest)))
                 ),
@@ -126,17 +169,17 @@ impl Store {
         }
         let parent = dest.parent().context("capsule store path")?;
         std::fs::create_dir_all(parent)?;
-        // write beside the destination and rename, so a failed build never leaves a half-written version
+        // write beside the destination and rename, so a failure never leaves a half-written version
         let tmp = parent.join(format!(".{}.tmp", built.version));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
         let write = || -> Result<()> {
-            std::fs::write(tmp.join(MANIFEST_FILE), &bytes)?;
-            if let Some(p) = &payload {
+            std::fs::write(tmp.join(MANIFEST_FILE), manifest)?;
+            if let Some(p) = payload {
                 std::fs::write(tmp.join(PAYLOAD_FILE), p)?;
             }
             std::fs::write(tmp.join(RECORD_FILE), serde_json::to_vec_pretty(&built)?)?;
-            std::fs::rename(&tmp, &dest).with_context(|| format!("moving the build into {}", dest.display()))
+            std::fs::rename(&tmp, &dest).with_context(|| format!("moving the Capsule into {}", dest.display()))
         };
         if let Err(e) = write() {
             let _ = std::fs::remove_dir_all(&tmp);
@@ -267,6 +310,11 @@ fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+/// The digest of a Capsule from its manifest and payload bytes: what `build` records and a registry annotation repeats.
+pub fn capsule_digest(manifest: &[u8], payload: Option<&[u8]>) -> String {
+    combined_digest(&sha256(manifest), payload.map(sha256).as_deref())
+}
+
 fn combined_digest(manifest: &str, payload: Option<&str>) -> String {
     sha256(format!("manifest:{manifest}\npayload:{}\n", payload.unwrap_or("none")).as_bytes())
 }
@@ -274,6 +322,51 @@ fn combined_digest(manifest: &str, payload: Option<&str>) -> String {
 /// `sha256:` and the first 12 hex digits.
 pub fn short(digest: &str) -> &str {
     &digest[..digest.len().min(19)]
+}
+
+/// Check a payload archive that came from somewhere else, and count its files. Every entry must be a plain file
+/// or folder inside one of the manifest's `payload` targets: no `..` or absolute paths, no links or devices, no
+/// setuid bits, and no more than [`MAX_PAYLOAD_BYTES`] of content or [`MAX_PAYLOAD_ENTRIES`] entries (so a
+/// small download can't expand into a flood of data).
+pub fn validate_payload_archive(capsule: &Capsule, gz: &[u8]) -> Result<u64> {
+    let targets: Vec<String> = capsule.spec.payload.iter().map(|p| p.to.trim_matches('/').to_owned()).collect();
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(gz));
+    let (mut files, mut entries, mut bytes) = (0u64, 0u64, 0u64);
+    for entry in archive.entries().context("the payload isn't a gzipped tar")? {
+        let entry = entry.context("reading the payload")?;
+        entries += 1;
+        if entries > MAX_PAYLOAD_ENTRIES {
+            bail!("the payload has more than {MAX_PAYLOAD_ENTRIES} entries");
+        }
+        let path = entry.path()?.into_owned();
+        let shown = path.display().to_string();
+        let mut parts = Vec::new();
+        for c in path.components() {
+            match c {
+                std::path::Component::Normal(p) => parts.push(p.to_str().with_context(|| format!("payload entry {shown} isn't valid Unicode"))?),
+                std::path::Component::CurDir => {}
+                _ => bail!("payload entry {shown} has an absolute or `..` path"),
+            }
+        }
+        let name = parts.join("/");
+        if !targets.iter().any(|t| name == *t || name.starts_with(&format!("{t}/"))) {
+            bail!("payload entry {shown} is outside the manifest's payload targets ({})", targets.iter().map(|t| format!("/{t}")).collect::<Vec<_>>().join(", "));
+        }
+        let kind = entry.header().entry_type();
+        match kind {
+            tar::EntryType::Regular | tar::EntryType::Continuous => files += 1,
+            tar::EntryType::Directory => {}
+            other => bail!("payload entry {shown} is a {other:?}; only files and folders are allowed"),
+        }
+        if entry.header().mode().unwrap_or(0) & 0o7000 != 0 {
+            bail!("payload entry {shown} has setuid, setgid or sticky bits");
+        }
+        bytes += entry.size();
+        if bytes > MAX_PAYLOAD_BYTES {
+            bail!("the payload holds more than {} MB", MAX_PAYLOAD_BYTES >> 20);
+        }
+    }
+    Ok(files)
 }
 
 enum Item {

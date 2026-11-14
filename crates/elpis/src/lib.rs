@@ -12,6 +12,7 @@
 
 pub mod boxfile;
 pub mod capsule;
+pub mod capsuleremote;
 pub mod capsulestore;
 pub mod console;
 pub mod credproxy;
