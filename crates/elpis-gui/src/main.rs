@@ -6,16 +6,21 @@
 //! (`capsules.rs`) is the same engine's Capsule workflow: browse, verify, run, pull, push, search, fork, sign, trust.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod boxes;
 mod capsules;
 mod help;
 
+use elpis::events::Activity;
+use elpis::netstack::{NetProbe, NetStats};
 use elpis::session::{debug_root, default_shim};
 use elpis::{Config, Log, Session};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Instant;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -26,6 +31,12 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[derive(Default)]
 struct AppState {
     vms: Mutex<HashMap<String, RunningVm>>,
+    /// Each box's traffic, kept after it stops so it stays visible
+    stats: std::sync::Mutex<HashMap<String, Arc<NetStats>>>,
+    /// Stopped boxes whose disk is open in a VM this app didn't start
+    elsewhere: std::sync::Mutex<HashSet<String>>,
+    /// The pull or create in progress, if any (one at a time)
+    job: std::sync::Mutex<Option<String>>,
 }
 
 /// A started VM, as the UI and the terminal button need it.
@@ -34,6 +45,17 @@ struct RunningVm {
     namespace: String,
     address: String,
     stop: mpsc::Sender<()>,
+    pid: Option<u32>,
+    started: Instant,
+    /// The VM's network: published ports, and "allow once" grants
+    net: Option<Arc<NetProbe>>,
+    /// Terminal sessions open in it (from any client), for auto-stop
+    activity: Arc<Activity>,
+    sample: Option<elpis::win::ProcessSample>,
+    cpu: f64,
+    ram: u64,
+    /// Auto-stop has already told it to stop
+    stopping: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -130,17 +152,39 @@ async fn start_vm(app: AppHandle, state: State<'_, AppState>, id: String, ports:
         return Err(format!("no work folder for {id}"));
     };
 
+    if elpis::workdir::file_busy(&work.join("rwlayer.img")) {
+        return Err(format!("{id}'s disk is open in another process (a VM started elsewhere, or one left running); end that VM first"));
+    }
     let mut config = Config::new(work.clone(), id.clone(), id.clone());
     config.host_ports = ports;
+    // through Elpis's network stack: internet, DNS, egress policy, the credential proxy, published ports and the activity view
+    config.network = true;
     config.shim_log = elpis::ShimLog::Warn;
     let log = ui_log(&app, &id);
 
     let session = Session::start(config, log).await.map_err(|e| format!("{e:#}"))?;
 
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    let net = session.network();
+    if let Some(n) = &net {
+        state.stats.lock().unwrap().insert(id.clone(), n.stats());
+    }
     state.vms.lock().await.insert(
         id.clone(),
-        RunningVm { work, namespace: id.clone(), address: session.address().to_owned(), stop: stop_tx },
+        RunningVm {
+            work,
+            namespace: id.clone(),
+            address: session.address().to_owned(),
+            stop: stop_tx,
+            pid: session.shim_pid(),
+            started: Instant::now(),
+            net,
+            activity: session.activity(),
+            sample: None,
+            cpu: 0.0,
+            ram: 0,
+            stopping: false,
+        },
     );
     let _ = app.emit("vm-state", VmState { id: id.clone(), running: true });
 
@@ -224,6 +268,7 @@ fn main() {
         .manage(AppState::default())
         .manage(help::HelpState::default())
         .setup(|app| {
+            boxes::spawn_ticker(app.handle().clone());
             let show = MenuItem::with_id(app, "show", "Show elpis", true, None::<&str>)?;
             let help = MenuItem::with_id(app, "help", "Help", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -259,6 +304,28 @@ fn main() {
             stop_vm,
             open_terminal,
             agent_command,
+            boxes::box_cards,
+            boxes::net_activity,
+            boxes::policy_get,
+            boxes::policy_add,
+            boxes::policy_remove,
+            boxes::policy_default,
+            boxes::net_mark_host,
+            boxes::net_answer,
+            boxes::ports_list,
+            boxes::port_add,
+            boxes::port_remove,
+            boxes::fs_list,
+            boxes::fs_toggle,
+            boxes::auto_stop_toggle,
+            boxes::kit_catalog,
+            boxes::kit_pull,
+            boxes::box_create,
+            boxes::new_box_defaults,
+            boxes::template_list,
+            boxes::template_save,
+            boxes::template_remove,
+            boxes::box_delete,
             help::open_help,
             help::help_pages,
             help::help_page,

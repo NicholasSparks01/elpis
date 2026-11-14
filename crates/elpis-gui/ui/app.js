@@ -76,6 +76,10 @@ const DIALOG_HELP = [
   { title: 'Trust a key', help: 'capsules#signing-and-trust' },
   { title: 'Fork', help: 'capsules#finding-and-forking' },
   { title: 'Registry manifest', help: 'capsules#sharing-through-a-registry' },
+  { title: 'New box', help: 'gui#making-and-removing-boxes' },
+  { title: 'Save as template', help: 'gui#templates' },
+  { title: 'Delete box', help: 'gui#making-and-removing-boxes' },
+  { title: 'Allow this connection', help: 'gui#network-rules-and-approvals' },
 ];
 
 /**
@@ -154,15 +158,15 @@ function renderList() {
   for (const vm of vms.values()) {
     const fromCapsule = vm.source && vm.source.startsWith('capsule ');
     el.append(h('div', {
-      class: 'vm' + (vm.running ? ' running' : '') + (vm.id === current ? ' active' : ''),
+      class: 'vm' + (vm.running ? ' running' : '') + (vm.id === current ? ' active' : '') + (cardOf(vm.id)?.elsewhere ? ' elsewhere' : ''),
       title: vm.source || '',
       onclick: () => { select(vm.id); showView('box'); },
     },
       h('div', { class: 'name' }, h('span', { class: 'state' }), vm.id, fromCapsule && h('span', { class: 'from', text: 'capsule' })),
-      h('div', { class: 'path', text: vm.path })));
+      cardLines(vm)));
   }
   if (!vms.size) {
-    el.append(emptyState('No boxes yet', h('div', null, 'Run a Capsule from the Capsules tab, or create one with ', h('code', { text: 'elpis-run create' }), '.')));
+    el.append(emptyState('No boxes yet', h('div', null, 'Press ', h('b', { text: '+ New' }), ' to make one from an agent kit, or run a Capsule from the Capsules tab.')));
   }
 }
 
@@ -170,6 +174,7 @@ function select(id) {
   current = id;
   const vm = vms.get(id);
   $('title').textContent = vm ? vm.id : 'Select a box';
+  boxSelected();
   const log = clear($('log'));
   for (const node of (logs.get(id) || [])) log.append(node);
   if (!logs.get(id)?.length) log.append(emptyState(vm ? 'Not started yet' : 'Pick a box', h('div', { text: vm ? 'Press Start to boot it; its log appears here.' : 'Choose one on the left, then Start.' })));
@@ -183,6 +188,7 @@ function updateButtons() {
   $('stop').disabled = !vm || !vm.running;
   $('term').disabled = !vm || !vm.running;
   $('agent').disabled = !vm || !vm.running;
+  updateBoxButtons();
 }
 
 function addLine(id, line) {
@@ -234,13 +240,15 @@ $('agent').onclick = async () => {
 };
 
 listen('log', (e) => addLine(e.payload.id, e.payload));
-listen('vm-state', (e) => { const vm = vms.get(e.payload.id); if (vm) { vm.running = e.payload.running; renderList(); updateButtons(); } });
+listen('vm-state', (e) => { const vm = vms.get(e.payload.id); if (vm) { vm.running = e.payload.running; renderList(); updateButtons(); pollCards(); } });
 
 // ---------------------------------------------------------------- help buttons and F1
 
 function openContextHelp() {
   if (view === 'capsules') helpTopic('gui#capsules');
   else if (view === 'trust') helpTopic('gui#trust-and-keys');
+  else if (view === 'agents') helpTopic('gui#agents');
+  else if (view === 'templates') helpTopic('gui#templates');
   else helpTopic('gui#boxes');
 }
 $('helpbtn').onclick = openContextHelp;
@@ -257,9 +265,12 @@ function showView(name) {
     b.classList.toggle('active', on);
     b.setAttribute('aria-selected', on);
   }
-  for (const v of ['box', 'capsules', 'trust']) $('view-' + v).hidden = v !== name;
+  for (const v of ['box', 'agents', 'capsules', 'templates', 'trust']) $('view-' + v).hidden = v !== name;
   if (name === 'capsules') loadCapsules();
   if (name === 'trust') loadTrust();
+  if (name === 'box') refreshPane();
+  if (name === 'agents') loadKits();
+  if (name === 'templates') loadTemplates();
 }
 for (const b of document.querySelectorAll('.tabs button')) b.onclick = () => showView(b.dataset.view);
 
@@ -641,7 +652,9 @@ function trustDialog(publicKey, ref) {
 
 // ---------------------------------------------------------------- start
 
-(async () => {
+// boxes.js is loaded after this file, so start once both are in
+window.addEventListener('DOMContentLoaded', async () => {
   try { const r = await invoke('capsule_default_registry'); if (r) { $('creg').value = r; } else { try { $('creg').value = localStorage.getItem('elpis.registry') || ''; } catch {} } } catch {}
   await refreshBoxes();
-})();
+  startPolling();
+});

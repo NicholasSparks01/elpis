@@ -5,7 +5,9 @@ A desktop GUI for the [elpis](../elpis) engine — start elpis VMs, watch their 
 ## What it does
 
 - **Lists work folders** under `%USERPROFILE%\elpis` (each with `bundle\config.json` + `rootfs.json` is a runnable VM). The folder name is the container id and namespace.
-- **Start / Stop** a VM. Start boots the microVM through the elpis shim; Stop sends SIGTERM/SIGKILL and tears the VM down.
+- **Start / Stop** a VM. Start boots (with its network through the elpis stack) the microVM through the elpis shim; Stop sends SIGTERM/SIGKILL and tears the VM down.
+- **Live cards and per-box views** (the same as the TUI): uptime, CPU, RAM and traffic on each sidebar card; sub-tabs for network activity (block or allow a host), network rules and the default (allow, ask or deny), published ports and shared folders; an approval dialog when a box waits on a host; auto-stop. `src/boxes.rs` and `ui/boxes.js`.
+- **New boxes, Agents and Templates**: make a box from an agent kit, a template or a copy; pull kits; save, use and remove templates; delete a box.
 - **Live log** per VM: the shim, Sailor, the guest kernel, container output and task events, colored like the CLI.
 - **host-port** box: let the container reach a Windows `127.0.0.1` port (e.g. Ollama on 11434).
 - **Terminal / Agent** buttons: open Windows Terminal running `elpis-run attach`, which joins the running VM over its shim ttrpc pipe and opens a TTY session. *Agent* runs the box's own agent command (a kit's or a Capsule's entrypoint). Several terminals can attach to one VM at once.

@@ -123,7 +123,7 @@ A full-screen dashboard: a card per box (status, uptime, CPU, memory, network co
 elpis-gui.exe
 ```
 
-A desktop window listing boxes with Start and Stop, a live log per box, and buttons that open terminals (including the box's own agent). Its **Capsules** tab covers the Capsule workflow (browse with trust badges, verify, run after a grant dialog, search, pull, push, fork, build, sign and remove), and **Trust & keys** manages your signing policy and keys. It is dark by default. Press **F1** for the built-in Help window, which shows these same pages offline. See [The desktop app](gui.md).
+A desktop window with everything the TUI does: boxes with live CPU, memory and network figures, a log, network activity, rules and approval prompts, ports and shared folders per box, terminals (including the box's own agent), new boxes from agents, templates or copies, and templates. Its **Capsules** tab covers the Capsule workflow (browse with trust badges, verify, run after a grant dialog, search, pull, push, fork, build, sign and remove), and **Trust & keys** manages your signing policy and keys. It is dark by default. Press **F1** for the built-in Help window, which shows these same pages offline. See [The desktop app](gui.md).
 
 ## Low-level CLI
 

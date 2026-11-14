@@ -19,7 +19,8 @@
   .brand b { font-size: 15px; font-weight: 600; letter-spacing: .02em; flex: 1; }
   .brand .help-q { margin-right: 2px; }
   #theme { padding: 3px 7px; font-size: 13px; line-height: 1; background: transparent; border-color: transparent; color: var(--dim); }
-  .sidehead { padding: 12px 14px 4px; color: var(--dim); font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
+  .sidehead { padding: 12px 14px 4px; color: var(--dim); font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; display: flex; align-items: center; justify-content: space-between; }
+  .sidehead button { text-transform: none; letter-spacing: 0; font-weight: 500; }
   #vmlist { overflow-y: auto; flex: 1; padding: 4px 8px; }
   .vm { padding: 8px 10px; border-radius: 6px; cursor: pointer; margin-bottom: 2px; border: 1px solid transparent; }
   .vm:hover { background: var(--raised); }
@@ -104,6 +105,33 @@
   .hit .body { flex: 1; min-width: 0; }
   .hit .ref { font-weight: 600; word-break: break-all; }
 
+  /* the Box view: info line, sub-tabs, panes */
+  .boxinfo { padding: 8px 16px; border-bottom: 1px solid var(--border); display: flex; gap: 18px; flex-wrap: wrap; color: var(--dim); font-size: 12px; min-height: 36px; align-items: center; }
+  .boxinfo b { color: var(--fg); font-weight: 600; }
+  .subtabs { display: flex; gap: 2px; padding: 4px 16px 0; align-items: center; border-bottom: 1px solid var(--border); }
+  .subtabs > button[data-sub] { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 6px 12px 7px; color: var(--dim); margin-bottom: -1px; }
+  .subtabs > button[data-sub]:hover { color: var(--fg); border-bottom-color: var(--border); background: none; }
+  .subtabs > button[data-sub].active { color: var(--fg); font-weight: 600; border-bottom-color: var(--accent-text); }
+  .subtabs > button.small { margin: 0 0 3px 6px; }
+  .pane { flex: 1; min-height: 0; }
+  .pane .pad { max-width: none; }
+  .formline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  .formline input[type=text] { width: 260px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .seg button { border: none; border-radius: 0; background: none; padding: 3px 12px; color: var(--dim); }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button.on { background: var(--raised); color: var(--fg); font-weight: 600; }
+  .seg button.on.allow { color: var(--green); } .seg button.on.deny { color: var(--red); } .seg button.on.ask { color: var(--magenta); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.act { text-align: right; white-space: nowrap; }
+  td.act button + button { margin-left: 4px; }
+  .allow { color: var(--green); } .deny { color: var(--red); } .ask { color: var(--magenta); } .dimtext { color: var(--dim); }
+  .vm .meta { color: var(--dim); font-size: 11px; margin: 1px 0 0 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .vm .meta.net { font-variant-numeric: tabular-nums; }
+  .vm .meta .warn { color: var(--yellow); } .vm .meta .bad { color: var(--red); }
+  .vm.running .state { box-shadow: 0 0 0 2px color-mix(in srgb, var(--green) 25%, transparent); }
+  .vm.elsewhere .state { background: var(--yellow); }
+
   /* trust view */
   .pad { padding: 16px 18px; max-width: 880px; }
   .pad h3 { margin: 22px 0 8px; font-size: 14px; font-weight: 600; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
@@ -149,7 +177,7 @@
       <button id="helpbtn" class="help-q" title="Help (F1)" aria-label="Help">?</button>
       <button id="theme" title="Theme" aria-label="Theme">◐</button>
     </div>
-    <div class="sidehead">Boxes</div>
+    <div class="sidehead"><span>Boxes</span><button id="newbox" class="small" title="Make a box from an agent kit, a template or another box">+ New</button></div>
     <div id="vmlist"></div>
     <div class="sidefoot">
       <div><button id="refresh" style="width:100%">Rescan work folders</button></div>
@@ -160,7 +188,9 @@
   <div id="main">
     <nav class="tabs" role="tablist" aria-label="Views">
       <button role="tab" data-view="box" class="active">Box</button>
+      <button role="tab" data-view="agents">Agents</button>
       <button role="tab" data-view="capsules">Capsules</button>
+      <button role="tab" data-view="templates">Templates</button>
       <button role="tab" data-view="trust">Trust &amp; keys</button>
     </nav>
 
@@ -177,7 +207,43 @@
         <button id="clear" title="Clear the log view">Clear</button>
         <button id="helpbox" class="help-q" title="Help with boxes" aria-label="Help with boxes">?</button>
       </div>
+      <div id="boxinfo" class="boxinfo"></div>
+      <div class="subtabs" role="tablist" aria-label="About this box" id="subtabs">
+        <button role="tab" data-sub="log" class="active">Logs</button>
+        <button role="tab" data-sub="net">Network activity</button>
+        <button role="tab" data-sub="rules">Network rules</button>
+        <button role="tab" data-sub="ports">Ports</button>
+        <button role="tab" data-sub="files">Files</button>
+        <span style="flex:1"></span>
+        <button id="autostop" class="small" title="">Auto-stop</button>
+        <button id="copybox" class="small" title="A new box with this one's image and settings, and an empty disk">Copy&#8230;</button>
+        <button id="savetpl" class="small" title="Save this stopped box as a template">Save as template&#8230;</button>
+        <button id="delbox" class="small danger" title="Delete this stopped box and its disk">Delete&#8230;</button>
+      </div>
       <div id="log"></div>
+      <div id="pane" class="pane scroll" hidden></div>
+    </section>
+
+    <section id="view-agents" class="view" hidden>
+      <div class="searchbar">
+        <input type="text" class="q" id="kq" placeholder="Filter agents and kits" aria-label="Filter" />
+        <span class="note" id="kinfo"></span>
+        <span style="flex:1"></span>
+        <button id="krefresh" title="Fetch the kit list from Docker Hub again">Refresh</button>
+        <button id="helpkits" class="help-q" title="Help with agents" aria-label="Help with agents">?</button>
+      </div>
+      <div class="progress" id="kprogress"></div>
+      <div id="kittable" class="scroll" style="flex:1"></div>
+    </section>
+
+    <section id="view-templates" class="view" hidden>
+      <div class="searchbar">
+        <span class="note">A template is a stopped box frozen with everything installed in it; new boxes start from it with their own empty disk.</span>
+        <span style="flex:1"></span>
+        <button id="tplsave" title="Save the selected (stopped) box as a template">Save selected box&#8230;</button>
+        <button id="helptpl" class="help-q" title="Help with templates" aria-label="Help with templates">?</button>
+      </div>
+      <div id="tpltable" class="scroll" style="flex:1"></div>
     </section>
 
     <section id="view-capsules" class="view" hidden>
@@ -210,5 +276,6 @@
   <div id="modal-root"></div>
   <div id="toasts" aria-live="polite"></div>
   <script src="app.js"></script>
+  <script src="boxes.js"></script>
 </body>
 </html>

@@ -4,7 +4,7 @@
 |---|---|
 | [Getting started](getting-started.md) | Build Elpis, build the guest, and run your first agent |
 | [Usage](usage.md) | Day-to-day work: boxes, agents, exec, ports, templates, Docker inside |
-| [The desktop app](gui.md) | Use the window: boxes, logs, terminals, Capsules, trust and keys |
+| [The desktop app](gui.md) | Use the window: boxes, network rules, ports, agents, templates, Capsules, trust and keys |
 | [The terminal dashboard](tui.md) | Use the TUI: every key, tab and popup |
 | [Command-line reference](cli.md) | Look up any `elpis-run` command and its options |
 | [Capsules](capsules.md) | Build, run, share, sign and verify portable agents |

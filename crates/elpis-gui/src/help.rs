@@ -672,7 +672,7 @@ mod tests {
         // every `helpTopic('page#anchor')` and `help: 'page#anchor'` in the page's scripts
         let mut missing = Vec::new();
         let mut seen = 0;
-        for (name, js) in [("app.js", include_str!("../ui/app.js")), ("help.js", include_str!("../ui/help.js"))] {
+        for (name, js) in [("app.js", include_str!("../ui/app.js")), ("boxes.js", include_str!("../ui/boxes.js")), ("help.js", include_str!("../ui/help.js"))] {
             for marker in ["helpTopic('", "help: '"] {
                 for part in js.split(marker).skip(1) {
                     let topic = part.split('\'').next().unwrap_or_default();
