@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>elpis</title>
+<style>
+  :root {
+    --bg: #1a1b26; --panel: #1f2335; --panel2: #24283b; --border: #2a2e45;
+    --fg: #c0caf5; --dim: #565f89; --accent: #7aa2f7; --green: #9ece6a;
+    --red: #f7768e; --yellow: #e0af68; --cyan: #7dcfff; --magenta: #bb9af7;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--fg); font: 13px/1.5 "Segoe UI", system-ui, sans-serif;
+    display: grid; grid-template-columns: 300px 1fr; grid-template-rows: 1fr auto; height: 100vh;
+  }
+  #sidebar { grid-row: 1 / 3; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+  .brand { padding: 14px 16px; font-weight: 600; font-size: 15px; letter-spacing: .3px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
+  .brand .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+  #vmlist { overflow-y: auto; flex: 1; padding: 6px; }
+  .vm { padding: 10px 12px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; border: 1px solid transparent; }
+  .vm:hover { background: var(--panel2); }
+  .vm.active { background: var(--panel2); border-color: var(--accent); }
+  .vm .name { font-weight: 600; display: flex; align-items: center; gap: 7px; }
+  .vm .state { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
+  .vm.running .state { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .vm .path { color: var(--dim); font-size: 11px; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sidefoot { padding: 10px; border-top: 1px solid var(--border); color: var(--dim); font-size: 11px; }
+  #main { grid-column: 2; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+  .toolbar { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .toolbar h2 { margin: 0; font-size: 14px; flex: 1; min-width: 150px; }
+  button {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 13px; font-size: 12px; cursor: pointer; font-family: inherit;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.primary { background: var(--accent); color: #1a1b26; border-color: var(--accent); font-weight: 600; }
+  button.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
+  .field { display: flex; align-items: center; gap: 5px; color: var(--dim); font-size: 11px; }
+  .field input { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 5px; padding: 4px 7px; width: 64px; font-family: inherit; }
+  #log { flex: 1; overflow-y: auto; padding: 10px 14px; font-family: "Cascadia Code", "Consolas", monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; min-height: 0; }
+  .ln { display: flex; gap: 8px; }
+  .ln .t { color: var(--dim); flex: none; }
+  .ln .g { flex: none; }
+  .white{color:#c0caf5}.gray{color:#9aa5ce}.red{color:var(--red)}.yellow{color:var(--yellow)}
+  .green{color:var(--green)}.darkgreen{color:#73a857}.cyan{color:var(--cyan)}.darkcyan{color:#4a9fc7}
+  .magenta{color:var(--magenta)}.blue{color:var(--accent)}.darkyellow{color:#c99a4e}
+  .empty { color: var(--dim); padding: 40px; text-align: center; }
+  .badge { font-size: 10px; padding: 1px 6px; border-radius: 4px; background: var(--border); color: var(--dim); }
+</style>
+</head>
+<body>
+  <div id="sidebar">
+    <div class="brand"><span class="dot"></span> elpis</div>
+    <div id="vmlist"></div>
+    <div class="sidefoot">
+      <div><button id="refresh" style="width:100%">Rescan work folders</button></div>
+      <div id="shimline" style="margin-top:8px"></div>
+    </div>
+  </div>
+  <div id="main">
+    <div class="toolbar">
+      <h2 id="title">Select a VM</h2>
+      <label class="field" title="Windows 127.0.0.1 port the container can reach (e.g. Ollama 11434)">
+        host&#8209;port <input id="hostport" value="11434" />
+      </label>
+      <button id="start" class="primary" disabled>Start</button>
+      <button id="stop" class="danger" disabled>Stop</button>
+      <button id="term" disabled>Terminal&#8230;</button>
+      <button id="opencode" disabled title="Open OpenCode in a terminal (needs host-port to reach a model)">OpenCode&#8230;</button>
+      <button id="clear" title="Clear the log view">Clear</button>
+    </div>
+    <div id="log"><div class="empty">Pick a VM on the left, then Start.</div></div>
+  </div>
+<script>
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+const $ = (id) => document.getElementById(id);
+let current = null;            // selected VM id
+const vms = new Map();         // id -> {id, work, namespace, path, running}
+const logs = new Map();        // id -> array of line nodes (kept per VM)
+
+function esc(s){ const d=document.createElement('span'); d.textContent=s; return d.innerHTML; }
+
+function renderList() {
+  const el = $('vmlist'); el.innerHTML = '';
+  for (const vm of vms.values()) {
+    const d = document.createElement('div');
+    d.className = 'vm' + (vm.running ? ' running' : '') + (vm.id === current ? ' active' : '');
+    d.innerHTML = `<div class="name"><span class="state"></span>${esc(vm.id)}</div><div class="path">${esc(vm.path)}</div>`;
+    d.onclick = () => select(vm.id);
+    el.appendChild(d);
+  }
+  if (!vms.size) el.innerHTML = '<div class="empty">No boxes found yet.<br>Create one with <code>elpis-run run AGENT</code> or <code>elpis-run create</code>.</div>';
+}
+
+function select(id) {
+  current = id;
+  const vm = vms.get(id);
+  $('title').textContent = vm ? vm.id : 'Select a VM';
+  const log = $('log'); log.innerHTML = '';
+  for (const node of (logs.get(id) || [])) log.appendChild(node);
+  if (!logs.get(id)?.length) log.innerHTML = '<div class="empty">Not started yet.</div>';
+  log.scrollTop = log.scrollHeight;
+  renderList(); updateButtons();
+}
+
+function updateButtons() {
+  const vm = vms.get(current);
+  $('start').disabled = !vm || vm.running;
+  $('stop').disabled = !vm || !vm.running;
+  $('term').disabled = !vm || !vm.running;
+  $('opencode').disabled = !vm || !vm.running;
+}
+
+function addLine(id, line) {
+  if (!logs.has(id)) logs.set(id, []);
+  const arr = logs.get(id);
+  const node = document.createElement('div');
+  node.className = 'ln';
+  node.innerHTML = `<span class="t">${esc(line.time)}</span><span class="g ${line.color}">[${esc(line.tag)}]</span><span class="${line.color}">${esc(line.text)}</span>`;
+  arr.push(node);
+  if (arr.length > 2000) arr.shift();
+  if (id === current) {
+    const log = $('log');
+    if (log.querySelector('.empty')) log.innerHTML = '';
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    log.appendChild(node);
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+}
+
+async function refresh() {
+  const list = await invoke('list_vms');
+  vms.clear();
+  for (const vm of list) vms.set(vm.id, vm);
+  if (current && !vms.has(current)) current = null;
+  if (!current && list.length) current = list[0].id;
+  select(current);
+  const v = await invoke('shim_info');
+  $('shimline').textContent = v;
+}
+
+$('refresh').onclick = refresh;
+$('clear').onclick = () => { if (current) { logs.set(current, []); select(current); } };
+
+$('start').onclick = async () => {
+  const vm = vms.get(current); if (!vm) return;
+  const hp = $('hostport').value.trim();
+  const ports = hp ? hp.split(',').map(s => parseInt(s.trim())).filter(Number.isInteger) : [];
+  $('start').disabled = true;
+  try { await invoke('start_vm', { id: vm.id, ports }); }
+  catch (e) { addLine(vm.id, { time: '', tag: 'gui', color: 'red', text: 'start failed: ' + e }); }
+};
+$('stop').onclick = async () => { const vm = vms.get(current); if (vm) { $('stop').disabled = true; await invoke('stop_vm', { id: vm.id }); } };
+$('term').onclick = () => current && invoke('open_terminal', { id: current, command: 'bash' });
+$('opencode').onclick = () => current && invoke('open_terminal', { id: current, command: 'cd /e/Project && opencode' });
+
+listen('log', (e) => addLine(e.payload.id, e.payload));
+listen('vm-state', (e) => { const vm = vms.get(e.payload.id); if (vm) { vm.running = e.payload.running; renderList(); updateButtons(); } });
+
+refresh();
+</script>
+</body>
+</html>

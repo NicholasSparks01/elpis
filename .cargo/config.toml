@@ -1,0 +1,3 @@
+[env]
+# libkrun embeds its own guest init at build time; elpis boots vminitd instead, so any file will do.
+KRUN_INIT_BINARY_PATH = { value = "third_party/krun-init-stub", relative = true }

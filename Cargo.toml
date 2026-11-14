@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/elpis", "crates/elpis-run", "crates/elpis-gui", "crates/elpis-tui", "crates/elpis-shim"]
+# libkrun is its own workspace (fetched by scripts/fetch-libkrun.sh)
+exclude = ["third_party"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smoltcp = "0.12"
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process", "sync", "time", "signal"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+elpis = { path = "crates/elpis" }
+
+[profile.release]
+strip = true

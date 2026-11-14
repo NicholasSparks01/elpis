@@ -1,0 +1,18 @@
+[package]
+name = "elpis-shim"
+description = "A containerd shim that runs elpis containers in a libkrun microVM on Windows Hypervisor Platform (no Sailor)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+elpis.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+socket2.workspace = true
+tokio.workspace = true
+windows-sys = { workspace = true, features = ["Win32_System_Power", "Win32_UI_WindowsAndMessaging"] }
+# libkrun 2.0 (WHP backend), pinned and patched by scripts/fetch-libkrun.sh; the library crate is `krun`
+krun = { package = "libkrun", path = "../../third_party/libkrun/src/libkrun", features = ["net", "blk"] }

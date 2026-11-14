@@ -1,0 +1,3 @@
+# Keep these LF on every checkout: bash runs the scripts, and git apply needs the patches byte-exact
+*.sh text eol=lf
+*.patch text eol=lf

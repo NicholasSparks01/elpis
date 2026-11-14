@@ -1,0 +1,127 @@
+diff --git a/src/libkrun/src/vmm/builder.rs b/src/libkrun/src/vmm/builder.rs
+index 3087dba..b16d584 100644
+--- a/src/libkrun/src/vmm/builder.rs
++++ b/src/libkrun/src/vmm/builder.rs
+@@ -38,7 +38,6 @@ use crate::vmm::device_manager::irq::IrqAllocator;
+ use crate::vmm::device_manager::legacy::PortIODeviceManager;
+ use crate::vmm::device_manager::mmio::MMIODeviceManager;
+ use crate::vmm::resources::VmResources;
+-#[cfg(not(target_os = "windows"))]
+ use crate::vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
+ #[cfg(target_arch = "x86_64")]
+ use devices::legacy::Cmos;
+@@ -599,7 +598,6 @@ pub enum Payload {
+         target_os = "windows"
+     ))]
+     KernelCopy,
+-    #[cfg(not(target_os = "windows"))]
+     ExternalKernel(ExternalKernel),
+     #[cfg(test)]
+     Empty,
+@@ -610,14 +608,7 @@ pub enum Payload {
+ 
+ impl Payload {
+     fn is_external_kernel(&self) -> bool {
+-        #[cfg(not(target_os = "windows"))]
+-        {
+-            matches!(self, Self::ExternalKernel(_))
+-        }
+-        #[cfg(target_os = "windows")]
+-        {
+-            false
+-        }
++        matches!(self, Self::ExternalKernel(_))
+     }
+ }
+ 
+@@ -650,10 +641,7 @@ pub fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrov
+         ))]
+         return Ok(Payload::KernelCopy);
+     } else if let Some(_external_kernel) = vm_resources.external_kernel() {
+-        #[cfg(not(target_os = "windows"))]
+         return Ok(Payload::ExternalKernel(_external_kernel.clone()));
+-        #[cfg(target_os = "windows")]
+-        unreachable!()
+     } else if vm_resources.firmware_config.is_some() {
+         Ok(Payload::Firmware)
+     } else {
+@@ -1739,6 +1727,63 @@ fn load_external_kernel(
+     ))
+ }
+ 
++#[cfg(target_os = "windows")]
++fn load_external_kernel(
++    guest_mem: &GuestMemoryMmap,
++    arch_mem_info: &ArchMemoryInfo,
++    external_kernel: &ExternalKernel,
++) -> std::result::Result<
++    (GuestAddress, Option<InitrdConfig>, Option<String>, bool),
++    StartMicrovmError,
++> {
++    use vm_memory::Bytes;
++    let bad = |m: &str| StartMicrovmError::ElfOpenKernel(io::Error::new(io::ErrorKind::InvalidData, m.to_string()));
++    if !matches!(external_kernel.format, KernelFormat::Elf) {
++        return Err(StartMicrovmError::KernelFormatUnsupported);
++    }
++    let data = std::fs::read(&external_kernel.path).map_err(StartMicrovmError::ElfOpenKernel)?;
++    let u16_at = |o: usize| u16::from_le_bytes([data[o], data[o + 1]]);
++    let u32_at = |o: usize| u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
++    let u64_at = |o: usize| u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
++    if data.len() < 64 || &data[..4] != b"ELF" || data[4] != 2 || data[5] != 1 {
++        return Err(bad("not a little-endian ELF64 kernel"));
++    }
++    let entry = u64_at(24);
++    let (phoff, phentsize, phnum) = (u64_at(32) as usize, u16_at(54) as usize, u16_at(56) as usize);
++    for i in 0..phnum {
++        let ph = phoff + i * phentsize;
++        if ph + 56 > data.len() {
++            return Err(bad("program header out of range"));
++        }
++        if u32_at(ph) != 1 {
++            continue; // PT_LOAD only
++        }
++        let (offset, paddr, filesz, memsz) = (u64_at(ph + 8) as usize, u64_at(ph + 24), u64_at(ph + 32) as usize, u64_at(ph + 40) as usize);
++        if offset + filesz > data.len() || filesz > memsz {
++            return Err(bad("segment out of range"));
++        }
++        guest_mem
++            .write_slice(&data[offset..offset + filesz], GuestAddress(paddr))
++            .map_err(StartMicrovmError::FirmwareInvalidAddress)?;
++        if memsz > filesz {
++            guest_mem
++                .write_slice(&vec![0u8; memsz - filesz], GuestAddress(paddr + filesz as u64))
++                .map_err(StartMicrovmError::FirmwareInvalidAddress)?;
++        }
++    }
++    debug!("load_external_kernel (windows): entry 0x{entry:x}");
++    let initrd_config = if let Some(initramfs_path) = &external_kernel.initramfs_path {
++        let data = std::fs::read(initramfs_path).map_err(StartMicrovmError::InitrdRead)?;
++        guest_mem
++            .write_slice(&data, GuestAddress(arch_mem_info.initrd_addr))
++            .map_err(StartMicrovmError::FirmwareInvalidAddress)?;
++        Some(InitrdConfig { address: GuestAddress(arch_mem_info.initrd_addr), size: data.len() })
++    } else {
++        None
++    };
++    Ok((GuestAddress(entry), initrd_config, external_kernel.cmdline.clone(), false))
++}
++
+ pub struct LoadedPayload {
+     pub guest_mem: GuestMemoryMmap,
+     pub entry_addr: GuestAddress,
+@@ -1905,7 +1950,6 @@ pub fn load_payload(
+                 pvh: false,
+             })
+         }
+-        #[cfg(not(target_os = "windows"))]
+         Payload::ExternalKernel(external_kernel) => {
+             let (entry_addr, initrd_config, cmdline, pvh) =
+                 load_external_kernel(&guest_mem, _arch_mem_info, external_kernel)?;
+@@ -2069,7 +2113,6 @@ pub fn create_guest_memory(
+             };
+             arch::arch_memory_regions(mem_size, Some(kernel_guest_addr), kernel_size, 0, None)
+         }
+-        #[cfg(not(target_os = "windows"))]
+         Payload::ExternalKernel(external_kernel) => {
+             #[cfg(not(feature = "tee"))]
+             let fw = _firmware_size;

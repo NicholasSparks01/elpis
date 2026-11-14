@@ -1,0 +1,411 @@
+diff --git a/src/devices/src/virtio/mod.rs b/src/devices/src/virtio/mod.rs
+index d65e4e5..690b934 100644
+--- a/src/devices/src/virtio/mod.rs
++++ b/src/devices/src/virtio/mod.rs
+@@ -34,7 +34,7 @@ mod pci;
+ mod queue;
+ #[cfg(not(feature = "tee"))]
+ pub mod rng;
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ pub mod rtc;
+ #[cfg(feature = "vhost-user")]
+ pub mod vhost_user;
+@@ -57,7 +57,7 @@ pub use self::pci::*;
+ pub use self::queue::{Descriptor, DescriptorChain, Queue};
+ #[cfg(not(feature = "tee"))]
+ pub use self::rng::*;
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ pub use self::rtc::*;
+ #[cfg(feature = "vhost-user")]
+ pub use self::vhost_user::VhostUserDevice;
+diff --git a/src/devices/src/virtio/rtc/clocks.rs b/src/devices/src/virtio/rtc/clocks.rs
+index 58477bd..d4b5ee1 100644
+--- a/src/devices/src/virtio/rtc/clocks.rs
++++ b/src/devices/src/virtio/rtc/clocks.rs
+@@ -13,6 +13,7 @@
+ //! which is what the alarm timer (see `timer.rs`) runs on.
+ 
+ use std::io;
++#[cfg(unix)]
+ use std::mem::zeroed;
+ 
+ use super::protocol::{
+@@ -37,18 +38,29 @@ pub(crate) struct Clock {
+     pub clock_type: u8,
+     pub leap_second_smearing: u8,
+     pub alarm: Option<Alarm>,
+-    clock_id: libc::clockid_t,
++    clock_id: Source,
+ }
+ 
+-impl Clock {
+-    fn new(clock_id: libc::clockid_t, clock_type: u8, has_alarm: bool) -> io::Result<Self> {
+-        // SAFETY: timespec is plain old data, all-zero is a valid value.
+-        let mut resolution: libc::timespec = unsafe { zeroed() };
+-        // SAFETY: `resolution` is a valid pointer for the duration of the call.
+-        if unsafe { libc::clock_getres(clock_id, &mut resolution) } != 0 {
+-            return Err(io::Error::last_os_error());
+-        }
++#[cfg(unix)]
++type Source = libc::clockid_t;
++
++/// Windows has no clock ids; the three clocks map onto the system time and the performance counter.
++#[cfg(target_os = "windows")]
++#[derive(Clone, Copy, Debug)]
++enum Source {
++    Realtime,
++    Tai,
++    Monotonic,
++}
+ 
++/// TAI − UTC since 2017-01-01 (there have been no leap seconds since).
++#[cfg(target_os = "windows")]
++const TAI_OFFSET_NS: u64 = 37_000_000_000;
++
++impl Clock {
++    fn new(clock_id: Source, clock_type: u8, has_alarm: bool) -> io::Result<Self> {
++        #[cfg(unix)]
++        Self::check(clock_id)?;
+         Ok(Self {
+             clock_type,
+             leap_second_smearing: VIRTIO_RTC_SMEAR_UNSPECIFIED,
+@@ -57,20 +69,68 @@ impl Clock {
+         })
+     }
+ 
++    #[cfg(unix)]
++    fn check(clock_id: Source) -> io::Result<()> {
++        // SAFETY: timespec is plain old data, all-zero is a valid value.
++        let mut resolution: libc::timespec = unsafe { zeroed() };
++        // SAFETY: `resolution` is a valid pointer for the duration of the call.
++        if unsafe { libc::clock_getres(clock_id, &mut resolution) } != 0 {
++            return Err(io::Error::last_os_error());
++        }
++        Ok(())
++    }
++
+     /// UTC (`CLOCK_REALTIME`), the only clock with an alarm.
+     pub fn new_utc() -> io::Result<Self> {
+-        Self::new(libc::CLOCK_REALTIME, VIRTIO_RTC_CLOCK_UTC_SMEARED, true)
++        #[cfg(unix)]
++        let source = libc::CLOCK_REALTIME;
++        #[cfg(target_os = "windows")]
++        let source = Source::Realtime;
++        Self::new(source, VIRTIO_RTC_CLOCK_UTC_SMEARED, true)
+     }
+ 
+     pub fn new_tai() -> io::Result<Self> {
+-        Self::new(libc::CLOCK_TAI, VIRTIO_RTC_CLOCK_TAI, false)
++        #[cfg(unix)]
++        let source = libc::CLOCK_TAI;
++        #[cfg(target_os = "windows")]
++        let source = Source::Tai;
++        Self::new(source, VIRTIO_RTC_CLOCK_TAI, false)
+     }
+ 
+     pub fn new_monotonic() -> io::Result<Self> {
+-        Self::new(libc::CLOCK_MONOTONIC, VIRTIO_RTC_CLOCK_MONOTONIC, false)
++        #[cfg(unix)]
++        let source = libc::CLOCK_MONOTONIC;
++        #[cfg(target_os = "windows")]
++        let source = Source::Monotonic;
++        Self::new(source, VIRTIO_RTC_CLOCK_MONOTONIC, false)
++    }
++
++    /// Reads the clock in nanoseconds.
++    #[cfg(target_os = "windows")]
++    pub fn read(&self) -> io::Result<u64> {
++        use std::sync::OnceLock;
++        use std::time::{Instant, SystemTime, UNIX_EPOCH};
++        let utc = || {
++            // GetSystemTimePreciseAsFileTime underneath
++            SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
++                .map_err(|_| io::Error::other("the system time is before 1970"))
++        };
++        Ok(match self.clock_id {
++            Source::Realtime => utc()?,
++            Source::Tai => utc()?.saturating_add(TAI_OFFSET_NS),
++            Source::Monotonic => {
++                // QueryPerformanceCounter underneath; counted from the first read, which is monotonic
++                static ORIGIN: OnceLock<Instant> = OnceLock::new();
++                let origin = ORIGIN.get_or_init(Instant::now);
++                u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
++            }
++        })
+     }
+ 
+     /// Reads the clock in nanoseconds.
++    #[cfg(unix)]
+     pub fn read(&self) -> io::Result<u64> {
+         // SAFETY: timespec is plain old data, all-zero is a valid value.
+         let mut spec: libc::timespec = unsafe { zeroed() };
+diff --git a/src/devices/src/virtio/rtc/device.rs b/src/devices/src/virtio/rtc/device.rs
+index 525172e..e22b618 100644
+--- a/src/devices/src/virtio/rtc/device.rs
++++ b/src/devices/src/virtio/rtc/device.rs
+@@ -425,7 +425,7 @@ impl Rtc {
+             match self.timer.arm(target) {
+                 Ok(()) => return,
+                 // The realtime clock was set while arming: evaluate again.
+-                Err(e) if e.raw_os_error() == Some(libc::ECANCELED) => continue,
++                Err(e) if super::timer::is_canceled(&e) => continue,
+                 Err(e) => {
+                     error!("rtc: cannot arm the alarm timer: {e}");
+                     return;
+diff --git a/src/devices/src/virtio/rtc/event_handler.rs b/src/devices/src/virtio/rtc/event_handler.rs
+index 4643022..81d8ead 100644
+--- a/src/devices/src/virtio/rtc/event_handler.rs
++++ b/src/devices/src/virtio/rtc/event_handler.rs
+@@ -1,7 +1,10 @@
+ // Copyright 2026 The libkrun Authors. All Rights Reserved.
+ // SPDX-License-Identifier: Apache-2.0
+ 
++#[cfg(unix)]
+ use std::os::unix::io::AsRawFd;
++#[cfg(target_os = "windows")]
++use utils::windows::AsRawFd;
+ 
+ use polly::event_manager::{EventManager, Subscriber};
+ use utils::epoll::{EpollEvent, EventSet};
+diff --git a/src/devices/src/virtio/rtc/timer.rs b/src/devices/src/virtio/rtc/timer.rs
+index f348589..6b91302 100644
+--- a/src/devices/src/virtio/rtc/timer.rs
++++ b/src/devices/src/virtio/rtc/timer.rs
+@@ -11,8 +11,10 @@
+ //! like the queue events; no thread is involved.
+ 
+ use std::io;
++#[cfg(unix)]
+ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+ 
++#[cfg(unix)]
+ const NSEC_PER_SEC: u64 = 1_000_000_000;
+ 
+ /// What reading the timer reported.
+@@ -21,14 +23,17 @@ pub(crate) enum TimerEvent {
+     /// The time that the timer was armed for was reached.
+     Expired,
+     /// The realtime clock was set while the timer was armed.
++    #[cfg_attr(target_os = "windows", allow(dead_code))]
+     Canceled,
+ }
+ 
++#[cfg(unix)]
+ #[derive(Debug)]
+ pub(crate) struct AlarmTimer {
+     fd: OwnedFd,
+ }
+ 
++#[cfg(unix)]
+ impl AlarmTimer {
+     pub fn new() -> io::Result<Self> {
+         // SAFETY: timerfd_create has no memory safety requirements.
+@@ -112,13 +117,133 @@ impl AlarmTimer {
+     }
+ }
+ 
++#[cfg(unix)]
+ impl AsRawFd for AlarmTimer {
+     fn as_raw_fd(&self) -> RawFd {
+         self.fd.as_raw_fd()
+     }
+ }
+ 
+-#[cfg(test)]
++/// Arming failed because the realtime clock was set meanwhile (try again).
++pub(crate) fn is_canceled(e: &io::Error) -> bool {
++    #[cfg(unix)]
++    return e.raw_os_error() == Some(libc::ECANCELED);
++    #[cfg(target_os = "windows")]
++    {
++        let _ = e;
++        false
++    }
++}
++
++/// Windows has no timerfd: an event the event loop can wait on, signalled by a thread that sleeps until the
++/// armed absolute UTC time. The thread wakes at least once a second, so a change of the system time is
++/// noticed (the alarm fires when UTC passes it, whichever way the clock moved).
++#[cfg(target_os = "windows")]
++pub(crate) struct AlarmTimer {
++    evt: utils::eventfd::EventFd,
++    state: std::sync::Arc<(std::sync::Mutex<WinTimerState>, std::sync::Condvar)>,
++}
++
++#[cfg(target_os = "windows")]
++#[derive(Default)]
++struct WinTimerState {
++    deadline: Option<u64>,
++    stop: bool,
++}
++
++#[cfg(target_os = "windows")]
++impl std::fmt::Debug for AlarmTimer {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let deadline = self.state.0.lock().map(|s| s.deadline).unwrap_or_default();
++        f.debug_struct("AlarmTimer").field("deadline", &deadline).finish()
++    }
++}
++
++#[cfg(target_os = "windows")]
++fn utc_now_ns() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
++        .unwrap_or(0)
++}
++
++#[cfg(target_os = "windows")]
++impl AlarmTimer {
++    pub fn new() -> io::Result<Self> {
++        use utils::eventfd::{EFD_NONBLOCK, EventFd};
++        let evt = EventFd::new(EFD_NONBLOCK)?;
++        let state = std::sync::Arc::new((std::sync::Mutex::new(WinTimerState::default()), std::sync::Condvar::new()));
++        let (shared, signal) = (state.clone(), evt.try_clone()?);
++        std::thread::Builder::new().name("rtc alarm".into()).spawn(move || {
++            let (lock, wake) = &*shared;
++            let mut st = lock.lock().unwrap();
++            loop {
++                if st.stop {
++                    return;
++                }
++                match st.deadline {
++                    None => st = wake.wait(st).unwrap(),
++                    Some(deadline) => {
++                        let now = utc_now_ns();
++                        if now >= deadline {
++                            st.deadline = None;
++                            let _ = signal.write(1);
++                        } else {
++                            let wait = std::time::Duration::from_nanos((deadline - now).min(1_000_000_000));
++                            st = wake.wait_timeout(st, wait).unwrap().0;
++                        }
++                    }
++                }
++            }
++        })?;
++        Ok(Self { evt, state })
++    }
++
++    fn set(&self, deadline: Option<u64>) {
++        let (lock, wake) = &*self.state;
++        lock.lock().unwrap().deadline = deadline;
++        wake.notify_all();
++    }
++
++    /// Arms the timer for the absolute UTC time `time_ns`.
++    pub fn arm(&self, time_ns: u64) -> io::Result<()> {
++        self.set(Some(time_ns.max(1)));
++        Ok(())
++    }
++
++    pub fn disarm(&self) -> io::Result<()> {
++        self.set(None);
++        Ok(())
++    }
++
++    pub fn read(&self) -> io::Result<Option<TimerEvent>> {
++        match self.evt.read() {
++            Ok(_) => Ok(Some(TimerEvent::Expired)),
++            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
++            Err(e) => Err(e),
++        }
++    }
++}
++
++#[cfg(target_os = "windows")]
++impl Drop for AlarmTimer {
++    fn drop(&mut self) {
++        let (lock, wake) = &*self.state;
++        if let Ok(mut st) = lock.lock() {
++            st.stop = true;
++        }
++        wake.notify_all();
++    }
++}
++
++#[cfg(target_os = "windows")]
++impl utils::windows::AsRawFd for AlarmTimer {
++    fn as_raw_fd(&self) -> utils::windows::RawFd {
++        self.evt.as_raw_fd()
++    }
++}
++
++#[cfg(all(test, unix))]
+ mod tests {
+     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+ 
+diff --git a/src/libkrun/src/api/device_builders.rs b/src/libkrun/src/api/device_builders.rs
+index f9fe91d..0726913 100644
+--- a/src/libkrun/src/api/device_builders.rs
++++ b/src/libkrun/src/api/device_builders.rs
+@@ -1430,18 +1430,18 @@ impl<'a> AttachDevice<'a> for RngDevice {
+     }
+ }
+ 
+-/// A virtio RTC providing UTC, TAI and monotonic clocks on Linux hosts.
++/// A virtio RTC providing UTC, TAI and monotonic clocks on Linux and Windows hosts.
+ ///
+ /// Adding this device disables the legacy RTC. The guest kernel must have a
+ /// virtio-rtc driver. On riscv64, the VMM adds this device automatically when
+ /// no RTC device is supplied.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ pub struct RtcDevice {
+     inner: Arc<Mutex<devices::virtio::Rtc>>,
+ }
+ 
+-#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "target_os = \"linux\""))]
+-#[cfg_attr(not(feature = "ffi"), cfg(target_os = "linux"))]
++#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "any(target_os = \"linux\", target_os = \"windows\")"))]
++#[cfg_attr(not(feature = "ffi"), cfg(any(target_os = "linux", target_os = "windows")))]
+ impl RtcDevice {
+     pub fn new() -> Result<Self, VmmError> {
+         let rtc =
+@@ -1452,13 +1452,14 @@ impl RtcDevice {
+     }
+ }
+ 
+-#[cfg_attr(feature = "ffi", ffier::export(cfg = "target_os = \"linux\""))]
+-#[cfg_attr(not(feature = "ffi"), cfg(target_os = "linux"))]
++#[cfg_attr(feature = "ffi", ffier::export(cfg = "any(target_os = \"linux\", target_os = \"windows\")"))]
++#[cfg_attr(not(feature = "ffi"), cfg(any(target_os = "linux", target_os = "windows")))]
+ impl<'a> AttachDevice<'a> for RtcDevice {
+     #[cfg_attr(feature = "ffi", ffier(skip))]
+     fn requirements(&self) -> DeviceRequirements {
+         DeviceRequirements {
+-            replaces_legacy_rtc: true,
++            // On Windows the legacy CMOS RTC stays: the guest reads it in early boot, before virtio-rtc probes
++            replaces_legacy_rtc: cfg!(target_os = "linux"),
+             ..Default::default()
+         }
+     }
+diff --git a/src/libkrun/src/api/mod.rs b/src/libkrun/src/api/mod.rs
+index 9eece64..d2cb609 100644
+--- a/src/libkrun/src/api/mod.rs
++++ b/src/libkrun/src/api/mod.rs
+@@ -45,7 +45,7 @@ pub use device_builders::PciDeviceManager;
+ pub use device_builders::PermissionSemantics;
+ #[cfg(not(feature = "tee"))]
+ pub use device_builders::RngDevice;
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ pub use device_builders::RtcDevice;
+ #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+ pub use device_builders::VhostUserDevice;
+@@ -100,9 +100,9 @@ ffier::library_definition!("krun", library_tag = 1,
+     crate::api::device_builders::BalloonDevice = 14,
+     #[cfg(not(feature = "tee"))]
+     crate::api::device_builders::RngDevice = 15,
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "windows"))]
+     crate::api::device_builders::RtcDevice = 27,
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "windows"))]
+     crate::api::device_builders::AttachDevice for crate::api::device_builders::RtcDevice,
+     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+     crate::api::device_builders::AttachDevice for crate::api::device_builders::FsDevice,

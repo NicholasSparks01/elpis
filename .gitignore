@@ -1,0 +1,4 @@
+/target
+/third_party/libkrun
+/guest/out
+/crates/elpis-gui/gen

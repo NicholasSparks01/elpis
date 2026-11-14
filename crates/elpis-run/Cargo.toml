@@ -1,0 +1,15 @@
+[package]
+name = "elpis-run"
+description = "Start a container on the Docker Sandboxes elpis shim with no sbx daemon and no containerd"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+elpis.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+windows-sys.workspace = true

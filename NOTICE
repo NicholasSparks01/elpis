@@ -1,0 +1,49 @@
+Elpis
+Copyright 2026 the Elpis authors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+------------------------------------------------------------------------------
+Portions derived from containerd/nerdbox
+https://github.com/containerd/nerdbox (Apache License 2.0)
+Copyright The containerd Authors
+
+  crates/elpis-shim/src/gpt.rs     port of internal/erofs/{gpt,vmdk}.go
+  crates/elpis-shim/src/setup.rs   port of internal/shim/task/{mount,networking,
+                                     ctrnetworking,transformers}.go
+  crates/elpis-shim/src/main.rs    socket forwarding and stdio streaming follow
+                                     internal/shim/task/{socketforward,io}.go
+  guest/Dockerfile                   adapted from nerdbox's Dockerfile (kernel and
+                                     rootfs stages)
+  guest/vminitd/                     compiled into nerdbox's vminitd at build time
+
+------------------------------------------------------------------------------
+Modifications to libkrun
+https://github.com/containers/libkrun (Apache License 2.0)
+Copyright The libkrun Authors
+
+  patches/libkrun/*.patch are changes to libkrun. scripts/fetch-libkrun.sh
+  downloads libkrun's source and applies them; libkrun itself is not part of
+  this repository.
+
+------------------------------------------------------------------------------
+Software that building or running this project downloads (not in this repository)
+
+  - Rust crates listed in Cargo.lock, under their own licenses (MIT, Apache-2.0,
+    BSD, ISC, Zlib, MPL-2.0, Unicode-3.0, CDLA-Permissive-2.0 and similar).
+  - The guest (guest/Dockerfile) builds or fetches the Linux kernel (GPL-2.0),
+    crun (GPL-2.0-or-later), erofs-utils (GPL-2.0-or-later) and e2fsprogs
+    (GPL-2.0, LGPL parts). Anyone who distributes built guest images
+    (elpis-kernel-*, elpis-rootfs-*.erofs) must meet those licenses' terms,
+    including offering the corresponding source.
+  - Container images and sbx "kits" pulled from registries such as Docker Hub
+    belong to their publishers and are under their own terms; this project
+    downloads them at the user's request and does not redistribute them.
+
+------------------------------------------------------------------------------
+Trademarks
+
+Docker, Docker Desktop and Docker Sandboxes are trademarks of Docker, Inc.
+Windows is a trademark of Microsoft Corporation. This project is independent
+and is not affiliated with, endorsed by or sponsored by Docker, Inc. or
+Microsoft. Names are used only to describe interoperability.

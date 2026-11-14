@@ -1,0 +1,18 @@
+[package]
+name = "elpis-gui"
+description = "Desktop GUI for elpis: start, watch and open terminals into elpis VMs, with no sbx daemon"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow.workspace = true
+elpis.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+tokio.workspace = true
+tauri = { version = "2", features = ["tray-icon"] }

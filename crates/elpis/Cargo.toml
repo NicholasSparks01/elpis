@@ -1,0 +1,25 @@
+[package]
+name = "elpis"
+description = "Drive the Docker Sandboxes elpis shim directly: the engine behind elpis-run and elpis-gui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+flate2 = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tar = "0.4"
+ureq = "2"
+# the credential proxy: TLS both ways (ring, as ureq already uses), per-host certificates, public roots
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+webpki-roots = "1"
+serde.workspace = true
+serde_json.workspace = true
+smoltcp.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+windows-sys.workspace = true

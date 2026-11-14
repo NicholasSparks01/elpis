@@ -1,0 +1,42 @@
+diff --git a/src/libkrun/src/vmm/windows/vstate.rs b/src/libkrun/src/vmm/windows/vstate.rs
+index 58adeec..161567e 100644
+--- a/src/libkrun/src/vmm/windows/vstate.rs
++++ b/src/libkrun/src/vmm/windows/vstate.rs
+@@ -526,7 +526,20 @@ impl Vcpu {
+                 }
+                 Ok(VcpuEmulation::Handled)
+             }
+-            VcpuExitReason::ApicEoi => Ok(VcpuEmulation::Handled),
++            VcpuExitReason::ApicEoi => {
++                // WHP reports the EOI of a level-triggered interrupt here instead of to the
++                // userspace IOAPIC. Without forwarding it, Remote-IRR stays set and every later
++                // interrupt on that pin (all virtio-pci INTx) is held forever.
++                let vector = self.whp_vcpu.apic_eoi_vector();
++                if let Some(bus) = &self.mmio_bus {
++                    bus.write(
++                        self.cpu_index() as u64,
++                        devices::legacy::IOAPIC_EOI_ADDRESS,
++                        &vector.to_le_bytes(),
++                    );
++                }
++                Ok(VcpuEmulation::Handled)
++            }
+             _ => {
+                 error!(
+                     "vCPU {} unhandled or unexpected exit reason: {:?}",
+diff --git a/src/whp/src/lib.rs b/src/whp/src/lib.rs
+index 626ddb9..a9b6367 100644
+--- a/src/whp/src/lib.rs
++++ b/src/whp/src/lib.rs
+@@ -825,6 +825,11 @@ impl WhpVcpu {
+         unsafe { &self.exit_context.Anonymous.IoPortAccess }
+     }
+ 
++    /// The vector of an `ApicEoi` exit.
++    pub fn apic_eoi_vector(&self) -> u32 {
++        unsafe { self.exit_context.Anonymous.ApicEoi.InterruptVector }
++    }
++
+     pub fn memory_access_context(&self) -> *const WHV_MEMORY_ACCESS_CONTEXT {
+         unsafe { &self.exit_context.Anonymous.MemoryAccess }
+     }
