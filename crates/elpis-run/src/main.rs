@@ -62,6 +62,11 @@ enum Command {
         #[command(subcommand)]
         action: TemplateAction,
     },
+    /// Build, inspect, list and remove Capsules: portable agent packages (see docs/capsule-manifest.md)
+    Capsule {
+        #[command(subcommand)]
+        action: CapsuleAction,
+    },
     /// Hosts a running box is waiting on (policy default "ask"); answer with `policy --work … allow|deny HOST`
     Approvals { r#box: String },
     /// Run a command in a box, like `sbx exec` (starting the box for it if it isn't running)
@@ -197,6 +202,31 @@ enum SecretAction {
 }
 
 #[derive(Subcommand)]
+enum CapsuleAction {
+    /// Validate a Capsule folder and store it as NAME@VERSION (a version is immutable)
+    Build {
+        /// The Capsule folder, or its capsule.yaml
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// Replace this version if it was built with different content
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show what a Capsule runs and what it asks for: a built NAME[@VERSION], or a folder
+    Inspect {
+        target: String,
+        /// Print the manifest as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List built Capsules
+    #[command(alias = "list")]
+    Ls,
+    /// Remove one built version (NAME@VERSION)
+    Rm { reference: String },
+}
+
+#[derive(Subcommand)]
 enum TemplateAction {
     /// Save a stopped box as a template
     Save { r#box: String, name: String },
@@ -315,6 +345,7 @@ fn main() {
                 0
             }),
             Some(Command::Template { action }) => template(action),
+            Some(Command::Capsule { action }) => capsule(action),
             Some(Command::Secret { action }) => secret(action),
             Some(Command::Ports { r#box, publish, unpublish }) => ports(&r#box, &publish, &unpublish),
             Some(Command::Exec(args)) => exec(args).await,
@@ -765,6 +796,48 @@ fn template(action: TemplateAction) -> Result<i32> {
         TemplateAction::Rm { name } => {
             workdir::remove_template(&name)?;
             println!("removed template {name}");
+        }
+    }
+    Ok(0)
+}
+
+fn capsule(action: CapsuleAction) -> Result<i32> {
+    use elpis::capsule::Capsule;
+    use elpis::capsulestore::{Store, short};
+    let store = Store::open();
+    match action {
+        CapsuleAction::Build { dir, force } => {
+            let b = store.build(&dir, force)?;
+            println!("built {}", b.reference());
+            println!("  digest   {}", short(&b.digest));
+            if b.payload_digest.is_some() {
+                println!("  payload  {} file(s), {:.1} KB compressed", b.payload_files, b.payload_bytes as f64 / 1024.0);
+            }
+            println!("  stored   {}", b.path.display());
+        }
+        CapsuleAction::Inspect { target, json } => {
+            // a folder or capsule.yaml on disk, else a built Capsule
+            let on_disk = Path::new(&target);
+            let (capsule, digest) = if on_disk.join("capsule.yaml").is_file() || on_disk.is_file() {
+                (Capsule::load(on_disk)?, None)
+            } else {
+                let built = store.find(&target)?;
+                (store.load(&built)?, Some(built.digest))
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&capsule)?);
+            } else {
+                print!("{}", capsule.summary(digest.as_deref()));
+            }
+        }
+        CapsuleAction::Ls => {
+            for b in store.list() {
+                println!("  {:<36} {}  {:>3} file(s)  {}", b.reference(), short(&b.digest), b.payload_files, b.description);
+            }
+        }
+        CapsuleAction::Rm { reference } => {
+            let b = store.remove(&reference)?;
+            println!("removed {}", b.reference());
         }
     }
     Ok(0)

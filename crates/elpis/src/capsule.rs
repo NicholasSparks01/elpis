@@ -469,6 +469,80 @@ impl Capsule {
         Ok(parse_version_lenient(elpis_version)? >= parse_min_version(min)?)
     }
 
+    /// A plain-text description for `capsule inspect`: what it runs, then what it asks for. The requests come
+    /// last and are worded as requests, since the consumer's policy decides what is granted.
+    pub fn summary(&self, digest: Option<&str>) -> String {
+        let (rt, spec) = (&self.spec.runtime, &self.spec);
+        let mut s = format!("{}\n", self.reference());
+        let mut line = |label: &str, text: String| s.push_str(&format!("  {label:<11}{text}\n"));
+        if !self.metadata.description.is_empty() {
+            line("about", self.metadata.description.clone());
+        }
+        if let Some(d) = digest {
+            line("digest", d.to_owned());
+        }
+        if let Some(from) = &self.metadata.derived_from {
+            line("forked from", from.clone());
+        }
+        if let Some(g) = &self.metadata.source {
+            line("source", format!("{} @ {}", g.git, g.commit));
+        }
+        if let Some(min) = &spec.compatibility.elpis {
+            line("needs elpis", min.clone());
+        }
+        line("image", rt.image.clone());
+        line("runs", format!("{}{}", rt.entrypoint.join(" "), rt.user.as_ref().map_or(String::new(), |u| format!("  (as {u})"))));
+        if !rt.env.is_empty() {
+            line("env", rt.env.keys().cloned().collect::<Vec<_>>().join(", "));
+        }
+        if !rt.install.is_empty() || !rt.startup.is_empty() {
+            line("setup", format!("{} install step(s), {} startup step(s)", rt.install.len(), rt.startup.len()));
+        }
+        for p in &spec.payload {
+            line("payload", format!("{} → {}", p.from, p.to));
+        }
+        if let Some(w) = &spec.interfaces.workspace {
+            line("workspace", format!("{} at {} ({})", if w.required { "required" } else { "optional" }, w.path, w.access.as_deref().unwrap_or("rw")));
+        }
+        for p in &spec.interfaces.ports {
+            line("port", format!("{}{}", p.guest, if p.purpose.is_empty() { String::new() } else { format!("  {}", p.purpose) }));
+        }
+        for v in &spec.resources.volumes {
+            line("volume", format!("{} ({})", v.path, v.size));
+        }
+        if spec.resources.docker {
+            line("docker", "starts a Docker engine in the box".to_owned());
+        }
+        for (name, b) in &spec.bindings {
+            line("input", format!("{name} ({}{})", b.kind, if b.required { ", required" } else { "" }));
+        }
+        for m in &spec.mcp.servers {
+            let how = match (&m.command, &m.endpoint) {
+                (Some(c), _) => format!("runs {}", c.join(" ")),
+                (_, Some(e)) => format!("input {}", e.binding),
+                _ => String::new(),
+            };
+            line("mcp", format!("{}  {how}", m.name));
+        }
+        for t in &spec.tests {
+            line("test", t.name.clone());
+        }
+        for e in &spec.examples {
+            line("example", e.name.clone());
+        }
+
+        let req = &spec.requests;
+        s.push_str("  asks for (you decide what is granted):\n");
+        let mut ask = |label: &str, text: String| s.push_str(&format!("    {label:<11}{text}\n"));
+        ask("network", if req.network.allow.is_empty() { "none".to_owned() } else { req.network.allow.join(", ") });
+        for c in &req.credentials {
+            let hosts: Vec<&str> = c.inject.iter().map(|i| i.domain.as_str()).collect();
+            ask("credential", format!("{} ({}){}", c.service, c.auth.join(", "), if hosts.is_empty() { String::new() } else { format!(" sent to {}", hosts.join(", ")) }));
+        }
+        ask("host", if req.host_access { "access to the Windows host".to_owned() } else { "no access".to_owned() });
+        s
+    }
+
     /// Environment the agent runs with (the engine merges it over the image's, as it does for kits).
     pub fn env(&self) -> &BTreeMap<String, String> {
         &self.spec.runtime.env
@@ -905,6 +979,25 @@ spec:
         assert!(added.iter().any(|a| a.contains("credential: openai")));
         // dropping requests never needs approval
         assert!(old.added_since(&new).is_empty());
+    }
+
+    #[test]
+    fn summary_lists_what_it_runs_and_what_it_asks_for() {
+        let s = Capsule::parse(&manifest()).unwrap().summary(Some("sha256:abc"));
+        for want in [
+            "myteam/code-reviewer@1.2.0",
+            "sha256:abc",
+            "node /opt/agent/main.js  (as agent)",
+            "required at /work (rw)",
+            "asks for (you decide what is granted)",
+            "api.anthropic.com, *.npmjs.org",
+            "anthropic (apiKey, oauth) sent to api.anthropic.com",
+            "no access",
+            "tickets (mcp-endpoint)",
+        ] {
+            assert!(s.contains(want), "missing {want:?} in:\n{s}");
+        }
+        assert!(!s.contains("hunter2"));
     }
 
     #[test]

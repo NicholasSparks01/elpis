@@ -94,6 +94,20 @@ A template freezes a stopped box's writable layer as a read-only layer on top of
 
 > A template captures whatever is in the box, including tokens an agent saved after you signed in inside it. Don't share templates you wouldn't share the box for.
 
+## Capsules (preview)
+
+A **Capsule** is a portable description of an agent: image, start command, files, and what it asks for (network, credentials). It is not a VM snapshot, so it carries no tokens or state. The manifest is described in [Capsule manifest](capsule-manifest.md). For now you can build, inspect and list Capsules locally; running, publishing and signing aren't implemented yet.
+
+| Task | Command |
+|---|---|
+| Validate a folder and store it as `NAME@VERSION` | `capsule build [DIR]` |
+| Replace a version built with different content | `capsule build DIR --force` |
+| Show what it runs and asks for | `capsule inspect NAME[@VERSION]` or `capsule inspect DIR` (`--json` prints the manifest) |
+| List built Capsules | `capsule ls` |
+| Remove one version | `capsule rm NAME@VERSION` |
+
+`build` refuses a manifest whose image isn't pinned by digest, and a payload that holds an obvious secret, leads outside the folder, or contains a symbolic link. Payload folders skip `.git`. Files ending in `.sh` or starting with `#!` become executable in the box, since Windows has no executable bit to read; everything else is read-only (0644) and owned by root. The same files always produce the same digest. A built version is immutable: rebuilding it with changed content fails unless you pass `--force`, so bump `metadata.version` instead.
+
 ## Docker inside the box
 
 Agent images built on `sbx/shell-docker-image` ask for a Docker engine, and Elpis starts one: the box gets its own `docker.img` at `/var/lib/docker`, `dockerd` starts on each boot, and the agent user can run `docker` immediately. Image pulls go through the box's network policy. Templates keep the Docker disk; a copied box starts with an empty one.
