@@ -149,7 +149,7 @@ pub struct InjectSpec {
 }
 
 impl StepSpec {
-    fn to_command(&self) -> SetupCommand {
+    pub fn to_command(&self) -> SetupCommand {
         let argv = match &self.command {
             CommandSpec::Script(s) => vec!["sh".into(), "-c".into(), s.clone()],
             CommandSpec::Argv(a) => a.clone(),

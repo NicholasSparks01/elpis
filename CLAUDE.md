@@ -28,11 +28,13 @@ cargo clippy --release --locked
 | `crates/elpis/src/credproxy.rs`, `secrets.rs` | TLS-intercepting API-key proxy; Windows Credential Manager (`elpis/SERVICE`) |
 | `crates/elpis/src/workdir.rs`, `boxfile.rs`, `kits.rs`, `registry.rs`, `mkfs.rs` | Boxes, templates, kit setup, image pulls, erofs/ext4 creation |
 | `crates/elpis/src/ttrpc.rs`, `pb.rs`, `events.rs`, `exec.rs`, `stdio.rs` | ttrpc client, protobuf, event socket, exec/TTY, stdio pipes |
+| `crates/elpis/src/capsule*.rs`, `b64.rs` | Capsules: manifest and validation (`capsule.rs`), local store, fork (`capsulestore.rs`), Ed25519 signing, trust and `verify` (`capsulesign.rs`), push/pull/search over OCI (`capsuleremote.rs`), making a box from one (`capsulerun.rs`); design in `docs/capsule-manifest.md` |
 | `crates/elpis-run` | CLI (clap); `attach` is used by the TUI/GUI for terminals |
-| `crates/elpis-tui`, `crates/elpis-gui` | ratatui dashboard; Tauri 2 GUI (`ui/index.html`) |
+| `crates/elpis-tui`, `crates/elpis-gui` | ratatui dashboard; Tauri 2 GUI (`ui/index.html`, `ui/app.js`; Capsule commands in `src/capsules.rs`; the Help window in `src/help.rs`, `ui/help.html`, `ui/help.js`, shared styles in `ui/theme.css`) |
 | `crates/elpis-shim/src` | containerd shim v2 with libkrun linked in: `setup.rs` (bundle → devices), `vm.rs`, `streams.rs`, `gpt.rs`, `mkfs.rs` (tools VM) |
 | `guest/` | Dockerfile for kernel + erofs rootfs (vminitd, crun, `elpis-mkfs`); `vminitd/clock` plugin |
 | `patches/libkrun/` | Numbered patches on the pinned libkrun commit |
+| `assets/`, `scripts/make-icons.py` | The icon master (`assets/elpis-icon.png`) and the script that regenerates the GUI's icons and logo from it (needs Pillow) |
 | `docs/` | User and reference docs; keep them in step with code |
 
 ## Rules
@@ -43,6 +45,7 @@ cargo clippy --release --locked
 - **libkrun changes** are new or updated patches in `patches/libkrun/` with a description of the problem; keep them small and upstreamable.
 - **Security-sensitive areas:** `netstack.rs`, `policy.rs`, `credproxy.rs`, `secrets.rs`, the shim's device setup, the libkrun patches. Prefer secure defaults, add tests, and update `docs/security.md` when behaviour changes.
 - **Docs move with code.** A changed command, option, default, file or env var updates `README.md` / `docs/` in the same change.
+- **The docs are the in-app Help.** `docs/*.md` are embedded in the GUI's Help window (`crates/elpis-gui/src/help.rs`, `ui/help.js`). A new doc must be added to `PAGES` there (a test fails until it is), every link between docs must resolve to a real heading (tested), a new `elpis-run` command must appear in `docs/cli.md` (tested), and a new Help topic used by the GUI must exist (tested). Raw HTML in a doc is shown as text, so don't use it.
 - No personal data (names, e-mails, user paths, box names) in code, docs or tests. Use `C:\Users\me\...`, `mybox`.
 - Errors use `anyhow::Context` and tell the user what to do next.
 

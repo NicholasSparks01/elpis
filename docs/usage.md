@@ -94,6 +94,17 @@ A template freezes a stopped box's writable layer as a read-only layer on top of
 
 > A template captures whatever is in the box, including tokens an agent saved after you signed in inside it. Don't share templates you wouldn't share the box for.
 
+## Capsules (preview)
+
+A **Capsule** is a portable description of an agent: image, start command, files, and what it asks for (network, credentials). It is not a VM snapshot, so it carries no tokens or state. You build one from a folder, run it after deciding what to grant it, and share it through any OCI registry, with signatures that others choose whether to trust.
+
+```bash
+elpis-run.exe capsule build my-agent
+elpis-run.exe capsule run myteam/my-agent
+```
+
+The full guide is [Capsules](capsules.md): building, running and what you grant, registries, signing and trust, search and fork. [Capsule manifest](capsule-manifest.md) is the reference for `capsule.yaml`, and every command is in the [CLI reference](cli.md#capsules).
+
 ## Docker inside the box
 
 Agent images built on `sbx/shell-docker-image` ask for a Docker engine, and Elpis starts one: the box gets its own `docker.img` at `/var/lib/docker`, `dockerd` starts on each boot, and the agent user can run `docker` immediately. Image pulls go through the box's network policy. Templates keep the Docker disk; a copied box starts with an empty one.
@@ -104,11 +115,7 @@ Agent images built on `sbx/shell-docker-image` ask for a Docker engine, and Elpi
 elpis-tui.exe
 ```
 
-- **Left:** a card per box: status, uptime, CPU and RAM, size and network counts, and **+ New box**.
-- **Right:** the selected box's tabs: network activity (`b` block, `w` allow a host), network rules (`n` new, `d` delete, `D` cycle the default), filesystem rules (`space` toggles read-only), ports, logs, the agent catalog and templates.
-- **Keys:** `s`/`x` start/stop, `Enter` toggle, `o` agent and `t` shell terminals, `a` copy, `X` delete, `T` save as template, `A` auto-stop, `Tab`/`1`–`7` tabs, `r` rescan, `q` quit. The mouse works too.
-
-VMs started from the TUI run inside its process, so quitting stops them.
+A full-screen dashboard: a card per box (status, uptime, CPU, memory, network counts) and, for the selected box, tabs for network activity, network rules, files, ports and logs, plus the agent catalog, Capsules and templates. Start and stop boxes, open terminals, make new boxes and run Capsules from the keyboard or the mouse. VMs started from the TUI run inside its process, so quitting stops them. Every key and tab is in [The terminal dashboard](tui.md).
 
 ## The GUI
 
@@ -116,7 +123,7 @@ VMs started from the TUI run inside its process, so quitting stops them.
 elpis-gui.exe
 ```
 
-A desktop window listing boxes with Start/Stop, a live log per box, and buttons that open terminals. It lives in the system tray. See [its README](../crates/elpis-gui/README.md).
+A desktop window with everything the TUI does: boxes with live CPU, memory and network figures, a log, network activity, rules and approval prompts, ports and shared folders per box, terminals (including the box's own agent), new boxes from agents, templates or copies, and templates. Its **Capsules** tab covers the Capsule workflow (browse with trust badges, verify, run after a grant dialog, search, pull, push, fork, build, sign and remove), and **Trust & keys** manages your signing policy and keys. It is dark by default. Press **F1** for the built-in Help window, which shows these same pages offline. See [The desktop app](gui.md).
 
 ## Low-level CLI
 

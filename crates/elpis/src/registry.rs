@@ -6,7 +6,8 @@
 //! into overlayfs ones). Layers are cached by digest under `%USERPROFILE%\elpis\images\layers`, and
 //! each pulled image gets a record (`images\<name>.json`) with its layers and run config.
 //!
-//! Anonymous pulls only, with the registry's bearer-token challenge (enough for public Docker Hub repos).
+//! Pulls are anonymous unless a login is stored for the registry (see [`login_service`]); the registry's
+//! bearer-token or Basic challenge is answered. The same client pushes Capsules (`capsuleremote.rs`).
 
 use crate::session::debug_root;
 use anyhow::{Context, Result, bail};
@@ -16,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, \
@@ -68,47 +70,184 @@ impl std::fmt::Display for Reference {
     }
 }
 
-/// A registry client for one repository, holding its pull token.
+/// A non-success HTTP answer from a registry. Callers that care (a missing manifest is a 404, not a failure)
+/// find it with `downcast_ref::<HttpStatus>()`.
+#[derive(Debug)]
+pub struct HttpStatus {
+    pub code: u16,
+    message: String,
+}
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+/// Registries on this machine are reached over plain HTTP (as Docker treats them); everything else is HTTPS only.
+fn is_local_host(host_port: &str) -> bool {
+    let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h);
+    host == "localhost" || host == "127.0.0.1"
+}
+
+/// The host part of `scheme://host[:port]/path`.
+fn url_host(url: &str) -> &str {
+    url.split_once("://").map_or("", |(_, rest)| rest.split('/').next().unwrap_or_default())
+}
+
+/// The Credential Manager service holding the login for a registry: `registry.HOST` with `:` as `_`, as
+/// `user:password`. Set it with `elpis-run secret set registry.HOST`. Only that registry ever receives it.
+pub fn login_service(registry: &str) -> String {
+    format!("registry.{}", registry.replace(':', "_"))
+}
+
+/// A registry client for one repository, holding its token and, if there is one, its login.
 pub struct Registry {
     pub reference: Reference,
     agent: ureq::Agent,
     token: Mutex<Option<String>>,
+    /// user, password: sent only to this registry (and to the token service it names, over HTTPS)
+    creds: Option<(String, String)>,
+    /// The registry asked for HTTP Basic, so send it on every request
+    basic: AtomicBool,
 }
 
 impl Registry {
+    /// A client for `reference`, logged in if a login is stored for its registry (see [`login_service`]).
     pub fn new(reference: Reference) -> Registry {
+        let creds = crate::secrets::get(&login_service(&reference.registry)).and_then(|s| s.split_once(':').map(|(u, p)| (u.to_owned(), p.to_owned())));
+        Registry::with_login(reference, creds)
+    }
+
+    pub fn with_login(reference: Reference, creds: Option<(String, String)>) -> Registry {
         let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(15)).timeout_read(Duration::from_secs(60)).build();
-        Registry { reference, agent, token: Mutex::new(None) }
+        Registry { reference, agent, token: Mutex::new(None), creds, basic: AtomicBool::new(false) }
+    }
+
+    /// A client for registry-level calls (the catalog) on `registry`, logged in if a login is stored for it.
+    pub fn for_host(registry: &str) -> Registry {
+        Registry::new(Reference { registry: registry.to_owned(), repository: String::new(), tag: String::new() })
+    }
+
+    /// A client for another repository on the same registry, with the same login.
+    pub fn sibling(&self, repository: &str, tag: &str) -> Registry {
+        let reference = Reference { registry: self.reference.registry.clone(), repository: repository.to_owned(), tag: tag.to_owned() };
+        Registry::with_login(reference, self.creds.clone())
+    }
+
+    /// The repositories the registry lists (`GET /v2/_catalog`), at most `limit`. Many registries don't offer it
+    /// (Docker Hub and GitHub's don't), which comes back as an HTTP error.
+    pub fn catalog(&self, limit: usize) -> Result<Vec<String>> {
+        self.get_paged(format!("{}://{}/v2/_catalog?n=100", self.scheme(), self.reference.api_host()), "repositories", limit)
+    }
+
+    /// The tags of `repository` on this registry, at most 5000.
+    pub fn tags(&self, repository: &str) -> Result<Vec<String>> {
+        self.get_paged(format!("{}://{}/v2/{repository}/tags/list?n=500", self.scheme(), self.reference.api_host()), "tags", 5000)
+    }
+
+    /// A list endpoint that pages with `Link: <…>; rel="next"`. Never follows a link to another host.
+    fn get_paged(&self, first: String, key: &str, limit: usize) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let mut url = first;
+        for _ in 0..100 {
+            let response = self.get(&url, None)?;
+            let next = response.header("link").and_then(next_link);
+            let mut body = Vec::new();
+            response.into_reader().take(8 << 20).read_to_end(&mut body)?;
+            let page: Value = serde_json::from_slice(&body).with_context(|| format!("{url} didn't return JSON"))?;
+            out.extend(page[key].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_owned)));
+            if out.len() >= limit {
+                out.truncate(limit);
+                break;
+            }
+            let Some(next) = next else { break };
+            let base = format!("{}://{}", self.scheme(), self.reference.api_host());
+            url = if next.starts_with('/') {
+                format!("{base}{next}")
+            } else if next.starts_with(&format!("{base}/")) {
+                next
+            } else {
+                bail!("the registry's next page is on another host ({next}); not following it");
+            };
+        }
+        Ok(out)
+    }
+
+    fn scheme(&self) -> &'static str {
+        if is_local_host(&self.reference.registry) { "http" } else { "https" }
     }
 
     fn url(&self, kind: &str, what: &str) -> String {
-        format!("https://{}/v2/{}/{kind}/{what}", self.reference.api_host(), self.reference.repository)
+        format!("{}://{}/v2/{}/{kind}/{what}", self.scheme(), self.reference.api_host(), self.reference.repository)
     }
 
-    /// GET with the current token, answering a 401 bearer challenge once.
     fn get(&self, url: &str, accept: Option<&str>) -> Result<ureq::Response> {
+        self.send("GET", url, accept, None, None)
+    }
+
+    /// One request with the current credentials, answering a 401 challenge once (a bearer token, or HTTP Basic).
+    fn send(&self, method: &str, url: &str, accept: Option<&str>, content_type: Option<&str>, body: Option<&[u8]>) -> Result<ureq::Response> {
         for attempt in 0..2 {
-            let mut request = self.agent.get(url);
+            let mut request = self.agent.request(method, url);
             if let Some(a) = accept {
                 request = request.set("Accept", a);
             }
+            if let Some(c) = content_type {
+                request = request.set("Content-Type", c);
+            }
             if let Some(t) = self.token.lock().unwrap().as_ref() {
                 request = request.set("Authorization", &format!("Bearer {t}"));
+            } else if let (true, Some(creds)) = (self.basic.load(Ordering::SeqCst), &self.creds) {
+                request = request.set("Authorization", &basic_header(creds));
             }
-            match request.call() {
+            let result = match body {
+                Some(b) => request.send_bytes(b),
+                None => request.call(),
+            };
+            match result {
                 Ok(response) => return Ok(response),
                 Err(ureq::Error::Status(401, response)) if attempt == 0 => {
                     let challenge = response.header("www-authenticate").unwrap_or_default().to_owned();
-                    *self.token.lock().unwrap() = Some(self.fetch_token(&challenge)?);
+                    self.authenticate(&challenge)?;
                 }
                 Err(ureq::Error::Status(code, response)) => {
-                    let body = response.into_string().unwrap_or_default();
-                    bail!("{url}: HTTP {code} {}", body.chars().take(200).collect::<String>());
+                    let text = response.into_string().unwrap_or_default();
+                    let mut message = format!("{method} {url}: HTTP {code} {}", text.chars().take(200).collect::<String>());
+                    if code == 401 || code == 403 {
+                        message.push_str(&format!(
+                            " (not authorized: for a private registry or to push, store a login with `elpis-run secret set {}`, value user:password)",
+                            login_service(&self.reference.registry)
+                        ));
+                    }
+                    return Err(HttpStatus { code, message }.into());
                 }
-                Err(e) => return Err(e).with_context(|| format!("GET {url}")),
+                // ureq's own message already names the URL
+                Err(e) => bail!("{method} {e}"),
             }
         }
-        bail!("{url}: not authorized (private repository?)")
+        bail!("{method} {url}: not authorized")
+    }
+
+    /// React to a 401: fetch a bearer token (with the login, if any), or switch to HTTP Basic.
+    fn authenticate(&self, challenge: &str) -> Result<()> {
+        if challenge.starts_with("Bearer ") {
+            *self.token.lock().unwrap() = Some(self.fetch_token(challenge)?);
+        } else if challenge.to_ascii_lowercase().starts_with("basic") {
+            if self.creds.is_none() {
+                bail!(
+                    "{} asks for a login; store one with `elpis-run secret set {}` (value user:password)",
+                    self.reference.registry,
+                    login_service(&self.reference.registry)
+                );
+            }
+            self.basic.store(true, Ordering::SeqCst);
+        } else {
+            bail!("unsupported auth challenge: {challenge}");
+        }
+        Ok(())
     }
 
     fn fetch_token(&self, challenge: &str) -> Result<String> {
@@ -117,13 +256,79 @@ impl Registry {
             params.split(',').find_map(|p| p.trim().strip_prefix(&format!("{name}=")).map(|v| v.trim_matches('"').to_owned()))
         };
         let realm = field("realm").context("auth challenge without a realm")?;
+        // the login goes to the token service, so it must not travel in clear to a remote host
+        if !(realm.starts_with("https://") || realm.starts_with("http://") && is_local_host(url_host(&realm))) {
+            bail!("the registry's token service {realm} isn't HTTPS; refusing to use it");
+        }
         let mut request = self.agent.get(&realm);
+        if let Some(creds) = &self.creds {
+            request = request.set("Authorization", &basic_header(creds));
+        }
         if let Some(service) = field("service") {
             request = request.query("service", &service);
         }
         let scope = field("scope").unwrap_or_else(|| format!("repository:{}:pull", self.reference.repository));
-        let body: Value = serde_json::from_reader(request.query("scope", &scope).call().context("fetching a pull token")?.into_reader())?;
+        let body: Value = serde_json::from_reader(request.query("scope", &scope).call().context("fetching a registry token")?.into_reader())?;
         body["token"].as_str().or(body["access_token"].as_str()).map(str::to_owned).context("token response without a token")
+    }
+
+    /// The manifest stored at `tag` (a tag or digest) exactly as the registry has it, with its digest; None if there is none.
+    pub fn manifest_bytes(&self, tag: &str, accept: &str) -> Result<Option<(Vec<u8>, String)>> {
+        match self.get(&self.url("manifests", tag), Some(accept)) {
+            Ok(response) => {
+                let mut body = Vec::new();
+                response.into_reader().take(8 << 20).read_to_end(&mut body)?;
+                let digest = format!("sha256:{:x}", Sha256::digest(&body));
+                Ok(Some((body, digest)))
+            }
+            Err(e) if e.downcast_ref::<HttpStatus>().is_some_and(|s| s.code == 404) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether the registry already has this blob.
+    pub fn blob_exists(&self, digest: &str) -> Result<bool> {
+        match self.send("HEAD", &self.url("blobs", digest), None, None, None) {
+            Ok(_) => Ok(true),
+            Err(e) if e.downcast_ref::<HttpStatus>().is_some_and(|s| s.code == 404) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Upload a blob in one request, unless the registry has it. `digest` must be the bytes' sha256.
+    pub fn push_blob(&self, digest: &str, bytes: &[u8]) -> Result<()> {
+        verify(digest, &Sha256::digest(bytes).into())?;
+        if self.blob_exists(digest)? {
+            return Ok(());
+        }
+        let start = self.send("POST", &self.url("blobs", "uploads/"), None, None, Some(&[])).context("starting a blob upload")?;
+        let location = start.header("location").context("the registry didn't say where to upload")?.to_owned();
+        let mut target = if location.starts_with("http://") || location.starts_with("https://") {
+            location
+        } else {
+            format!("{}://{}{location}", self.scheme(), self.reference.api_host())
+        };
+        target.push(if target.contains('?') { '&' } else { '?' });
+        target.push_str(&format!("digest={digest}"));
+        self.send("PUT", &target, None, Some("application/octet-stream"), Some(bytes)).with_context(|| format!("uploading {digest}"))?;
+        Ok(())
+    }
+
+    /// Store a manifest under `tag`; returns its digest.
+    pub fn push_manifest(&self, tag: &str, media_type: &str, bytes: &[u8]) -> Result<String> {
+        self.send("PUT", &self.url("manifests", tag), None, Some(media_type), Some(bytes)).with_context(|| format!("storing the manifest as {tag}"))?;
+        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    }
+
+    /// A blob read whole, at most `limit` bytes, checked against its digest.
+    pub fn blob_limited(&self, digest: &str, limit: u64) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        self.get(&self.url("blobs", digest), None)?.into_reader().take(limit + 1).read_to_end(&mut body)?;
+        if body.len() as u64 > limit {
+            bail!("{digest} is bigger than {} MB", limit >> 20);
+        }
+        verify(digest, &Sha256::digest(&body).into())?;
+        Ok(body)
     }
 
     /// The manifest for linux/amd64 (resolving an index) and its digest.
@@ -163,6 +368,18 @@ impl Registry {
     pub fn blob(&self, digest: &str) -> Result<Box<dyn Read + Send + Sync>> {
         Ok(self.get(&self.url("blobs", digest), None)?.into_reader())
     }
+}
+
+/// The target of a `rel="next"` entry in a `Link` header.
+fn next_link(header: &str) -> Option<String> {
+    header.split(',').find(|p| p.contains("rel=\"next\"") || p.contains("rel=next")).and_then(|p| {
+        let (start, end) = (p.find('<')?, p.find('>')?);
+        (start < end).then(|| p[start + 1..end].to_owned())
+    })
+}
+
+fn basic_header((user, password): &(String, String)) -> String {
+    format!("Basic {}", crate::b64::encode(format!("{user}:{password}").as_bytes()))
 }
 
 fn verify(digest: &str, actual: &[u8; 32]) -> Result<()> {
@@ -474,6 +691,25 @@ impl<R: Read> Read for Counting<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_headers_give_the_next_page() {
+        assert_eq!(next_link("</v2/_catalog?last=b&n=100>; rel=\"next\"").as_deref(), Some("/v2/_catalog?last=b&n=100"));
+        assert_eq!(next_link("<https://r.example/v2/x/tags/list?last=1>; rel=\"next\", <x>; rel=\"prev\"").as_deref(), Some("https://r.example/v2/x/tags/list?last=1"));
+        assert_eq!(next_link("</a>; rel=\"prev\""), None);
+        assert_eq!(next_link(""), None);
+        assert_eq!(next_link(">oops<; rel=\"next\""), None);
+    }
+
+    #[test]
+    fn only_this_machine_is_reached_over_plain_http() {
+        assert!(is_local_host("localhost:5000") && is_local_host("127.0.0.1:5000") && is_local_host("localhost"));
+        assert!(!is_local_host("registry.example.com") && !is_local_host("127.0.0.1.evil.com:5000") && !is_local_host("evil-localhost"));
+        assert_eq!(url_host("https://auth.example.com:8443/token?x=1"), "auth.example.com:8443");
+        assert!(!is_local_host(url_host("http://localhost.evil.com/token")));
+        assert_eq!(login_service("localhost:5000"), "registry.localhost_5000");
+        assert_eq!(login_service("ghcr.io"), "registry.ghcr.io");
+    }
 
     #[test]
     fn references() {

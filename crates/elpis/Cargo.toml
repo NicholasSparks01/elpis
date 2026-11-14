@@ -9,6 +9,8 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 flate2 = "1"
+# Ed25519 for Capsule signatures; already in the build through rustls and rcgen
+ring = "0.17"
 serde_yaml = "0.9"
 sha2 = "0.10"
 tar = "0.4"

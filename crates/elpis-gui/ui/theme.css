@@ -1,0 +1,63 @@
+/* Elpis theme: the palette, resets and controls shared by the main window and the Help window. */
+/* A plain dark UI: neutral greys, thin borders, flat surfaces. Green is the only accent and it is used sparingly:
+   the primary action, the active tab and selection, focus, a running box, and "good" status. Every colour below is
+   one of these variables, so the light theme is just a second set of values. */
+:root {
+  color-scheme: dark;
+  --bg: #0d1117; --panel: #161b22; --panel2: #1c2128; --raised: #21262d; --well: #0a0d12;
+  --border: #30363d; --fg: #e6edf3; --dim: #8b949e;
+  --accent: #1f7a33; --accent-hover: #26913d; --accent-fg: #ffffff; --accent-text: #3fb950;
+  --green: #3fb950; --yellow: #d29922; --red: #ff7b72; --cyan: #56d4dd; --magenta: #d2a8ff; --blue: #79c0ff;
+  --scrim: rgba(1, 4, 9, .72);
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f6f8fa; --panel: #ffffff; --panel2: #f6f8fa; --raised: #eaeef2; --well: #f0f3f6;
+  --border: #d0d7de; --fg: #1f2328; --dim: #59636e;
+  --accent: #1a7f37; --accent-hover: #166b2e; --accent-fg: #ffffff; --accent-text: #187232;
+  --green: #187232; --yellow: #8a5d00; --red: #cf222e; --cyan: #0a6f7a; --magenta: #8250df; --blue: #0550ae;
+  --scrim: rgba(31, 35, 40, .45);
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: #f6f8fa; --panel: #ffffff; --panel2: #f6f8fa; --raised: #eaeef2; --well: #f0f3f6;
+    --border: #d0d7de; --fg: #1f2328; --dim: #59636e;
+    --accent: #1a7f37; --accent-hover: #166b2e; --accent-fg: #ffffff; --accent-text: #187232;
+    --green: #187232; --yellow: #8a5d00; --red: #cf222e; --cyan: #0a6f7a; --magenta: #8250df; --blue: #0550ae;
+    --scrim: rgba(31, 35, 40, .45);
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg); color: var(--fg); font: 13px/1.5 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+}
+[hidden] { display: none !important; }
+::selection { background: color-mix(in srgb, var(--green) 35%, transparent); }
+code, .mono { font-family: "Cascadia Mono", "Cascadia Code", "Consolas", monospace; font-size: 12px; }
+:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 1px; }
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+button {
+  background: var(--raised); color: var(--fg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 12px; font-size: 12px; cursor: pointer; font-family: inherit; white-space: nowrap;
+}
+button:hover:not(:disabled) { border-color: var(--dim); }
+button:disabled { opacity: .4; cursor: default; }
+button.primary { background: var(--accent); color: var(--accent-fg); border-color: color-mix(in srgb, var(--accent-fg) 18%, transparent); font-weight: 600; }
+button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: color-mix(in srgb, var(--accent-fg) 30%, transparent); }
+button.danger { color: var(--red); }
+button.danger:hover:not(:disabled) { border-color: var(--red); }
+button.small { padding: 1px 9px; font-size: 11px; }
+input[type=text], select, textarea {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; font-family: inherit; font-size: 12px;
+}
+input[type=text]::placeholder { color: color-mix(in srgb, var(--dim) 70%, transparent); }
+input[type=text]:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent-text); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-text) 25%, transparent); }
+input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; margin: 1px 0 0; flex: none; }
+
+/* the small round ? that opens Help at the matching topic */
+button.help-q { width: 22px; height: 22px; padding: 0; border-radius: 50%; font-size: 12px; font-weight: 600; line-height: 1; color: var(--dim); background: transparent; flex: none; }
+button.help-q:hover:not(:disabled) { color: var(--accent-text); border-color: var(--accent-text); }

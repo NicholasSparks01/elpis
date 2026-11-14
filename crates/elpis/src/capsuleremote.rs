@@ -1,0 +1,1041 @@
+//! Capsules in OCI registries: `capsule push` and `capsule pull`.
+//!
+//! A Capsule is stored as an OCI image manifest with its own artifact type, so any OCI registry holds it:
+//! the config blob is `capsule.yaml` exactly as built, and the single layer is `payload.tar.gz` (a Capsule
+//! without a payload carries the standard empty layer). Because both blobs are stored byte for byte, a pulled
+//! Capsule has the same digest as the one that was pushed. The repository is `REGISTRY[/PREFIX]/NAMESPACE/NAME`
+//! and the tag is the version.
+//!
+//! Nothing here is signed yet: whoever can write the tag can replace it, and the registry's own claims are never
+//! trusted (the manifest is re-validated, the payload archive is checked entry by entry, digests are recomputed).
+//! Pull by digest (`REF@sha256:…`) to pin exactly what you reviewed. The media types are Elpis's own, not the sbx
+//! kit type.
+
+use crate::capsule::Capsule;
+use crate::capsulesign::{SignatureRecord, is_key_id, verify_record};
+use crate::capsulestore::{Built, Store, capsule_digest};
+use crate::registry::{Reference, Registry};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+pub const ARTIFACT_TYPE: &str = "application/vnd.elpis.capsule.v1";
+pub const CONFIG_MEDIA: &str = "application/vnd.elpis.capsule.config.v1+yaml";
+pub const PAYLOAD_MEDIA: &str = "application/vnd.elpis.capsule.payload.v1.tar+gzip";
+const MANIFEST_MEDIA: &str = "application/vnd.oci.image.manifest.v1+json";
+const EMPTY_MEDIA: &str = "application/vnd.oci.empty.v1+json";
+/// sha256 of `{}`, the OCI empty descriptor's blob
+const EMPTY_DIGEST: &str = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+/// The Capsule's own digest, repeated on the manifest so `push` can tell "already there" from "different"
+const ANNOTATION_DIGEST: &str = "dev.elpis.capsule.digest";
+pub const SIGNATURES_TYPE: &str = "application/vnd.elpis.capsule.signatures.v1";
+pub const SIGNATURE_MEDIA: &str = "application/vnd.elpis.capsule.signature.v1+json";
+const MAX_SIGNATURES: usize = 64;
+const MAX_SIGNATURE_BYTES: u64 = 16 << 10;
+const MAX_CONFIG_BYTES: u64 = 1 << 20;
+const MAX_PAYLOAD_BYTES: u64 = 256 << 20;
+
+#[derive(Debug)]
+pub struct Pushed {
+    /// `registry/repository:tag`
+    pub reference: String,
+    /// The registry manifest's digest: pull `reference@digest` to get exactly this
+    pub digest: String,
+    /// False when the registry already held this exact Capsule
+    pub uploaded: bool,
+    /// How many signatures the registry holds for it afterwards
+    pub signatures: usize,
+}
+
+/// Where `built` goes under `dest` (`REGISTRY` or `REGISTRY/PREFIX`): `dest/NAMESPACE/NAME:VERSION`.
+pub fn reference_for(dest: &str, built: &Built) -> Result<Reference> {
+    let dest = dest.trim().trim_end_matches('/');
+    if dest.is_empty() || dest.contains("://") || dest.contains('@') {
+        bail!("{dest:?} should be a registry like registry.example.com, optionally with a path (registry.example.com/team)");
+    }
+    Reference::parse(&format!("{dest}/{}:{}", built.name, built.version))
+}
+
+/// Push a built Capsule (`NAME@VERSION`) to `dest`.
+pub fn push(store: &Store, spec: &str, dest: &str, force: bool, progress: &dyn Fn(&str)) -> Result<Pushed> {
+    let built = store.find(spec)?;
+    let reference = reference_for(dest, &built)?;
+    push_to(&Registry::new(reference), store, &built, force, progress)
+}
+
+pub fn push_to(registry: &Registry, store: &Store, built: &Built, force: bool, progress: &dyn Fn(&str)) -> Result<Pushed> {
+    let (manifest_yaml, payload) = store.files(built)?; // checks the stored files against their digests first
+    let tag = registry.reference.tag.clone();
+    let reference = registry.reference.to_string();
+
+    // A release is immutable: the same content is fine, different content needs --force
+    let mut already = None;
+    if let Some((body, digest)) = registry.manifest_bytes(&tag, MANIFEST_MEDIA)? {
+        let remote: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if remote["annotations"][ANNOTATION_DIGEST].as_str() == Some(built.digest.as_str()) {
+            progress(&format!("{reference} already has this Capsule"));
+            already = Some(digest);
+        } else if !force {
+            bail!("{reference} already exists with different content; a release is immutable, so bump metadata.version, or pass --force to overwrite it");
+        }
+    }
+    let (digest, uploaded) = match already {
+        Some(digest) => (digest, false),
+        None => (upload_content(registry, built, &manifest_yaml, payload.as_deref(), progress)?, true),
+    };
+
+    // Signatures go up either way, so signing an already-pushed Capsule and pushing again publishes the signature.
+    // Only signatures that are valid for exactly this Capsule are sent.
+    let valid: Vec<SignatureRecord> = store.signatures(built).into_iter().filter(|r| verify_record(r, &built.name, &built.version, &built.digest).is_ok()).collect();
+    let signatures = push_signatures(registry, &built.digest, &valid)?;
+    if signatures > 0 {
+        progress(&format!("{signatures} signature(s) published"));
+    }
+    Ok(Pushed { reference, digest, uploaded, signatures })
+}
+
+/// Upload the config, payload and manifest; returns the registry manifest's digest.
+fn upload_content(registry: &Registry, built: &Built, manifest_yaml: &[u8], payload: Option<&[u8]>, progress: &dyn Fn(&str)) -> Result<String> {
+    let tag = registry.reference.tag.clone();
+    progress(&format!("uploading the manifest ({} bytes)", manifest_yaml.len()));
+    registry.push_blob(&built.manifest_digest, manifest_yaml)?;
+    let layer = match (&built.payload_digest, &payload) {
+        (Some(digest), Some(bytes)) => {
+            progress(&format!("uploading the payload ({:.1} KB)", bytes.len() as f64 / 1024.0));
+            registry.push_blob(digest, bytes)?;
+            json!({ "mediaType": PAYLOAD_MEDIA, "digest": digest, "size": bytes.len() })
+        }
+        _ => {
+            registry.push_blob(EMPTY_DIGEST, b"{}")?;
+            json!({ "mediaType": EMPTY_MEDIA, "digest": EMPTY_DIGEST, "size": 2 })
+        }
+    };
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": MANIFEST_MEDIA,
+        "artifactType": ARTIFACT_TYPE,
+        "config": { "mediaType": CONFIG_MEDIA, "digest": built.manifest_digest, "size": manifest_yaml.len() },
+        "layers": [layer],
+        "annotations": {
+            "org.opencontainers.image.version": built.version,
+            "org.opencontainers.image.description": built.description,
+            ANNOTATION_DIGEST: built.digest,
+        },
+    });
+    registry.push_manifest(&tag, MANIFEST_MEDIA, &serde_json::to_vec(&manifest)?)
+}
+
+/// Where a Capsule's signatures live: a tag derived from its content digest, so signing doesn't touch the release tag.
+pub fn signatures_tag(capsule_digest: &str) -> String {
+    format!("sha256-{}.sig", capsule_digest.trim_start_matches("sha256:"))
+}
+
+/// The signatures a registry holds for a Capsule. Unreadable ones are skipped; none of them is trusted by being here.
+pub fn fetch_signatures(registry: &Registry, capsule_digest: &str) -> Result<Vec<SignatureRecord>> {
+    let Some((body, _)) = registry.manifest_bytes(&signatures_tag(capsule_digest), MANIFEST_MEDIA)? else { return Ok(Vec::new()) };
+    let manifest: Value = serde_json::from_slice(&body).context("the registry's signature manifest isn't JSON")?;
+    if manifest["artifactType"] != SIGNATURES_TYPE {
+        bail!("the registry's signature tag holds something that isn't an Elpis signature set");
+    }
+    let mut found = Vec::new();
+    for layer in manifest["layers"].as_array().into_iter().flatten().filter(|l| l["mediaType"] == SIGNATURE_MEDIA).take(MAX_SIGNATURES) {
+        let Some(digest) = layer["digest"].as_str() else { continue };
+        if layer["size"].as_u64().is_none_or(|s| s > MAX_SIGNATURE_BYTES) {
+            continue;
+        }
+        let blob = registry.blob_limited(digest, MAX_SIGNATURE_BYTES)?;
+        if let Ok(record) = serde_json::from_slice::<SignatureRecord>(&blob)
+            && is_key_id(&record.key_id)
+        {
+            found.push(record);
+        }
+    }
+    Ok(found)
+}
+
+/// Add `records` to the registry's signature set for a Capsule, keeping what is already there (a record from the
+/// same key replaces the old one). Returns how many signatures the set holds afterwards.
+pub fn push_signatures(registry: &Registry, capsule_digest: &str, records: &[SignatureRecord]) -> Result<usize> {
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let existing = fetch_signatures(registry, capsule_digest)?;
+    let mut merged: std::collections::BTreeMap<String, SignatureRecord> = existing.iter().map(|r| (r.key_id.clone(), r.clone())).collect();
+    for r in records {
+        merged.insert(r.key_id.clone(), r.clone());
+    }
+    if merged.len() == existing.len() && merged.values().all(|r| existing.contains(r)) {
+        return Ok(existing.len());
+    }
+    if merged.len() > MAX_SIGNATURES {
+        bail!("the registry already holds {} signatures for this Capsule; refusing to add more", existing.len());
+    }
+    registry.push_blob(EMPTY_DIGEST, b"{}")?;
+    let mut layers = Vec::new();
+    for r in merged.values() {
+        let bytes = serde_json::to_vec(r)?;
+        let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        registry.push_blob(&digest, &bytes)?;
+        layers.push(json!({ "mediaType": SIGNATURE_MEDIA, "digest": digest, "size": bytes.len(), "annotations": { "dev.elpis.capsule.keyid": r.key_id } }));
+    }
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": MANIFEST_MEDIA,
+        "artifactType": SIGNATURES_TYPE,
+        "config": { "mediaType": EMPTY_MEDIA, "digest": EMPTY_DIGEST, "size": 2 },
+        "layers": layers,
+        "annotations": { ANNOTATION_DIGEST: capsule_digest },
+    });
+    registry.push_manifest(&signatures_tag(capsule_digest), MANIFEST_MEDIA, &serde_json::to_vec(&manifest)?)?;
+    Ok(merged.len())
+}
+
+/// Pull `reference` (`REGISTRY/NAMESPACE/NAME:VERSION`, or `@sha256:…` to pin) into the local store.
+pub fn pull(store: &Store, reference: &str, force: bool, progress: &dyn Fn(&str)) -> Result<Built> {
+    pull_from(&Registry::new(Reference::parse(reference)?), store, force, progress)
+}
+
+/// What a registry holds for a reference, read without the payload: the Capsule, and its manifest digest.
+pub fn inspect(reference: &str) -> Result<(Capsule, String)> {
+    let (_, capsule, digest, _) = fetch_description(&Registry::new(Reference::parse(reference)?))?;
+    Ok((capsule, digest))
+}
+
+/// The manifest and config of a Capsule in a registry, checked: (manifest JSON, Capsule, manifest digest, config bytes).
+fn fetch_description(registry: &Registry) -> Result<(Value, Capsule, String, Vec<u8>)> {
+    let tag = &registry.reference.tag;
+    let (body, digest) = registry.manifest_bytes(tag, MANIFEST_MEDIA)?.with_context(|| format!("{} isn't in the registry", registry.reference))?;
+    if tag.starts_with("sha256:") && *tag != digest {
+        bail!("the registry returned a manifest with digest {digest} for {tag}");
+    }
+    let manifest: Value = serde_json::from_slice(&body).context("the registry's manifest isn't JSON")?;
+    if manifest["artifactType"] != ARTIFACT_TYPE || manifest["config"]["mediaType"] != CONFIG_MEDIA {
+        bail!("{} isn't an Elpis Capsule (artifact type {})", registry.reference, manifest["artifactType"].as_str().unwrap_or("none"));
+    }
+    let config_digest = manifest["config"]["digest"].as_str().context("the manifest has no config digest")?;
+    if manifest["config"]["size"].as_u64().is_none_or(|s| s > MAX_CONFIG_BYTES) {
+        bail!("the Capsule manifest is missing its size or is over {} KB", MAX_CONFIG_BYTES >> 10);
+    }
+    let config = registry.blob_limited(config_digest, MAX_CONFIG_BYTES)?;
+    let capsule = Capsule::parse(std::str::from_utf8(&config).context("the Capsule manifest isn't UTF-8")?)?;
+
+    // The reference has to say what the Capsule says it is, or a tag could pass one Capsule off as another
+    let (repo, name) = (&registry.reference.repository, &capsule.metadata.name);
+    if repo != name && !repo.ends_with(&format!("/{name}")) {
+        bail!("{} holds the Capsule {}, which doesn't belong in the repository {repo}", registry.reference, capsule.reference());
+    }
+    if !tag.starts_with("sha256:") && *tag != capsule.metadata.version {
+        bail!("tag {tag} holds {}; a tag must be the Capsule's version", capsule.reference());
+    }
+    Ok((manifest, capsule, digest, config))
+}
+
+pub fn pull_from(registry: &Registry, store: &Store, force: bool, progress: &dyn Fn(&str)) -> Result<Built> {
+    let (manifest, capsule, manifest_digest, config) = fetch_description(registry)?;
+    progress(&format!("{} ({})", capsule.reference(), crate::capsulestore::short(&manifest_digest)));
+
+    let mut payload = None;
+    for layer in manifest["layers"].as_array().into_iter().flatten() {
+        match layer["mediaType"].as_str() {
+            Some(PAYLOAD_MEDIA) if payload.is_none() => {
+                let digest = layer["digest"].as_str().context("the payload layer has no digest")?;
+                if layer["size"].as_u64().is_none_or(|s| s > MAX_PAYLOAD_BYTES) {
+                    bail!("the payload layer is missing its size or is over {} MB", MAX_PAYLOAD_BYTES >> 20);
+                }
+                progress(&format!("downloading the payload ({:.1} KB)", layer["size"].as_u64().unwrap_or(0) as f64 / 1024.0));
+                payload = Some(registry.blob_limited(digest, MAX_PAYLOAD_BYTES)?);
+            }
+            Some(EMPTY_MEDIA) => {}
+            other => bail!("the Capsule has an unexpected layer ({})", other.unwrap_or("no media type")),
+        }
+    }
+
+    // Our own digest from the bytes we hold; the registry's annotation is only a cross-check
+    let digest = capsule_digest(&config, payload.as_deref());
+    if let Some(claimed) = manifest["annotations"][ANNOTATION_DIGEST].as_str()
+        && claimed != digest
+    {
+        bail!("the registry's annotation says this Capsule is {claimed}, but its contents hash to {digest}");
+    }
+    let built = store.import(&config, payload.as_deref(), &registry.reference.to_string(), force)?;
+
+    // Keep the signatures that are cryptographically valid for exactly this Capsule; whether any of them is
+    // trusted is for `verify` and the consumer's trust policy to say, not the registry.
+    match fetch_signatures(registry, &built.digest) {
+        Ok(found) => {
+            let kept = found.iter().filter(|r| verify_record(r, &built.name, &built.version, &built.digest).is_ok() && store.add_signature(&built, r).is_ok()).count();
+            progress(&format!("{kept} valid signature(s) of {} found", found.len()));
+        }
+        Err(e) => progress(&format!("couldn't read signatures: {e:#}")),
+    }
+    Ok(built)
+}
+
+/// A Capsule release found in a registry. Everything but `reference` and `version` is what the registry's
+/// manifest annotations claim: display text, not something to trust.
+#[derive(Clone, Debug)]
+pub struct Found {
+    /// `registry/repository:version`: what `capsule pull` takes
+    pub reference: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    /// The Capsule digest the manifest claims (empty if it doesn't say)
+    pub digest: String,
+    /// A signature set exists in the registry for that digest. Says nothing about who signed it or whether you trust them.
+    pub signatures_published: bool,
+}
+
+/// Repositories read from a catalog, and repositories whose manifests are fetched, at most.
+const MAX_REPOSITORIES: usize = 2000;
+const MAX_EXAMINED: usize = 300;
+const VERSIONS_SHOWN: usize = 10;
+const MAX_DESCRIPTION_CHARS: usize = 300;
+
+/// The Capsule name a repository holds: its last two path components (`team/myteam/tool` → `myteam/tool`).
+fn capsule_name_of(repository: &str) -> Option<String> {
+    let parts: Vec<&str> = repository.split('/').collect();
+    let name = format!("{}/{}", parts.get(parts.len().checked_sub(2)?)?, parts.last()?);
+    crate::capsule::validate_capsule_name(&name).ok().map(|_| name)
+}
+
+/// Search a registry (`REGISTRY` or `REGISTRY/PREFIX`) for Capsules whose name or description contains every word
+/// of `query` (all of them, when it is empty). Reads the registry's catalog, then only each Capsule's manifest, never
+/// a payload. Needs a registry that lists its repositories; the newest version of each is shown unless `all_versions`.
+pub fn search(registry_and_prefix: &str, query: &str, all_versions: bool, progress: &dyn Fn(&str)) -> Result<Vec<Found>> {
+    let dest = registry_and_prefix.trim().trim_end_matches('/');
+    if dest.is_empty() || dest.contains("://") || dest.contains('@') {
+        bail!("{dest:?} should be a registry like registry.example.com, optionally with a path (registry.example.com/team)");
+    }
+    let (host, prefix) = dest.split_once('/').unwrap_or((dest, ""));
+    search_in(&Registry::for_host(host), prefix, query, all_versions, progress)
+}
+
+pub fn search_in(registry: &Registry, prefix: &str, query: &str, all_versions: bool, progress: &dyn Fn(&str)) -> Result<Vec<Found>> {
+    let host = registry.reference.registry.clone();
+    let listed = registry.catalog(MAX_REPOSITORIES).map_err(|e| match e.downcast_ref::<crate::registry::HttpStatus>() {
+        Some(s) if matches!(s.code, 404 | 405 | 501) => anyhow::anyhow!(
+            "{host} doesn't list its repositories (GET /v2/_catalog gave HTTP {}), so it can't be searched; if you know a Capsule's repository, `capsule inspect --remote {host}/NAMESPACE/NAME:VERSION` reads it directly",
+            s.code
+        ),
+        _ => e,
+    })?;
+    let prefix = prefix.trim_matches('/');
+    let mut repos: Vec<String> = listed.into_iter().filter(|r| prefix.is_empty() || r == prefix || r.starts_with(&format!("{prefix}/"))).filter(|r| capsule_name_of(r).is_some()).collect();
+    repos.sort();
+    if repos.len() > MAX_EXAMINED {
+        progress(&format!("{} repositories match the prefix; searching the first {MAX_EXAMINED} (add a path to narrow it)", repos.len()));
+        repos.truncate(MAX_EXAMINED);
+    }
+
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut found = Vec::new();
+    for repo in repos {
+        let Some(name) = capsule_name_of(&repo) else { continue };
+        let tags = match registry.tags(&repo) {
+            Ok(t) => t,
+            Err(e) => {
+                progress(&format!("skipping {repo}: {e:#}"));
+                continue;
+            }
+        };
+        let mut versions: Vec<(String, (u64, u64, u64))> = tags.iter().filter_map(|t| Some((t.clone(), crate::capsule::parse_version(t).ok()?))).collect();
+        versions.sort_by_key(|v| v.1);
+        let keep = if all_versions { VERSIONS_SHOWN } else { 1 };
+        for (tag, _) in versions.iter().rev().take(keep) {
+            let client = registry.sibling(&repo, tag);
+            let Ok(Some((body, _))) = client.manifest_bytes(tag, MANIFEST_MEDIA) else { continue };
+            let Ok(manifest) = serde_json::from_slice::<Value>(&body) else { continue };
+            if manifest["artifactType"] != ARTIFACT_TYPE {
+                continue;
+            }
+            let annotation = |k: &str| manifest["annotations"][k].as_str().unwrap_or_default();
+            // a manifest that claims another version than its tag is mislabeled; it can't be pulled anyway
+            if annotation("org.opencontainers.image.version") != tag {
+                continue;
+            }
+            let description: String = annotation("org.opencontainers.image.description").chars().take(MAX_DESCRIPTION_CHARS).collect();
+            let haystack = format!("{name} {description}").to_lowercase();
+            if !words.iter().all(|w| haystack.contains(w.as_str())) {
+                continue;
+            }
+            let digest = annotation(ANNOTATION_DIGEST).to_owned();
+            found.push(Found {
+                reference: format!("{host}/{repo}:{tag}"),
+                name: name.clone(),
+                version: tag.clone(),
+                description,
+                signatures_published: !digest.is_empty() && tags.contains(&signatures_tag(&digest)),
+                digest,
+            });
+        }
+    }
+    found.sort_by(|a, b| (&a.name, crate::capsule::parse_version(&a.version).unwrap_or_default()).cmp(&(&b.name, crate::capsule::parse_version(&b.version).unwrap_or_default())));
+    Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    const DIGEST: &str = "docker.io/library/alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    // ------------------------------------------------------------ a registry that speaks just enough OCI
+
+    #[derive(Clone)]
+    enum Auth {
+        Open,
+        /// The exact Authorization header required
+        Basic(String),
+        /// A token service that wants this Basic login, at `realm` (default: this server's /token)
+        Bearer { login: String, realm: Option<String> },
+    }
+
+    #[derive(Default)]
+    struct State {
+        blobs: HashMap<String, Vec<u8>>,
+        /// "repo:ref" → manifest bytes (by tag and by digest)
+        manifests: HashMap<String, Vec<u8>>,
+        /// Serve these bytes instead of the blob with this digest
+        corrupt: Option<String>,
+        /// Answer GET /v2/_catalog with 404, as registries that don't list their repositories do
+        no_catalog: bool,
+        /// Repositories per catalog or tag-list page (0: everything in one)
+        page_size: usize,
+    }
+
+    struct Mock {
+        addr: String,
+        state: Arc<Mutex<State>>,
+    }
+
+    fn mock(auth: Auth) -> Mock {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let state = Arc::new(Mutex::new(State::default()));
+        let (st, a) = (state.clone(), addr.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (st, auth, a) = (st.clone(), auth.clone(), a.clone());
+                std::thread::spawn(move || serve(stream, &st, &auth, &a));
+            }
+        });
+        Mock { addr, state }
+    }
+
+    fn respond(stream: &mut TcpStream, status: &str, headers: &[(&str, String)], body: &[u8], declared: usize, send_body: bool) {
+        let mut out = format!("HTTP/1.1 {status}\r\nContent-Length: {declared}\r\nConnection: close\r\n");
+        for (k, v) in headers {
+            out.push_str(&format!("{k}: {v}\r\n"));
+        }
+        out.push_str("\r\n");
+        let _ = stream.write_all(out.as_bytes());
+        if send_body {
+            let _ = stream.write_all(body);
+        }
+    }
+
+    fn serve(mut stream: TcpStream, state: &Mutex<State>, auth: &Auth, addr: &str) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
+        let mut parts = line.split_whitespace();
+        let (method, target) = (parts.next().unwrap_or_default().to_owned(), parts.next().unwrap_or_default().to_owned());
+        let mut headers = HashMap::new();
+        loop {
+            let mut h = String::new();
+            if reader.read_line(&mut h).unwrap_or(0) == 0 {
+                return;
+            }
+            let h = h.trim_end();
+            if h.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = h.split_once(':') {
+                headers.insert(k.to_lowercase(), v.trim().to_owned());
+            }
+        }
+        let mut body = vec![0; headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0)];
+        reader.read_exact(&mut body).unwrap();
+        let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        let given = headers.get("authorization").cloned().unwrap_or_default();
+
+        if path == "/token" {
+            return match auth {
+                Auth::Bearer { login, .. } if given == *login => respond(&mut stream, "200 OK", &[], br#"{"token":"T"}"#, 13, true),
+                _ => respond(&mut stream, "401 Unauthorized", &[], b"", 0, false),
+            };
+        }
+        let allowed = match auth {
+            Auth::Open => true,
+            Auth::Basic(want) => given == *want,
+            Auth::Bearer { .. } => given == "Bearer T",
+        };
+        if !allowed {
+            let challenge = match auth {
+                Auth::Basic(_) => "Basic realm=\"mock\"".to_owned(),
+                Auth::Bearer { realm, .. } => {
+                    format!("Bearer realm=\"{}\",service=\"mock\",scope=\"repository:r:pull,push\"", realm.clone().unwrap_or(format!("http://{addr}/token")))
+                }
+                Auth::Open => unreachable!(),
+            };
+            return respond(&mut stream, "401 Unauthorized", &[("WWW-Authenticate", challenge)], b"", 0, false);
+        }
+
+        let rest = path.strip_prefix("/v2/").unwrap_or_default();
+        let mut state = state.lock().unwrap();
+        // listings: the catalog and each repository's tags, paged with Link headers like a real registry
+        let listing = if rest == "_catalog" {
+            if state.no_catalog {
+                return respond(&mut stream, "404 Not Found", &[], b"{}", 2, true);
+            }
+            let mut repos: Vec<String> = state.manifests.keys().filter_map(|k| k.split_once(':').map(|(r, _)| r.to_owned())).collect();
+            Some(("repositories", repos.drain(..).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>(), "/v2/_catalog".to_owned()))
+        } else if let Some(repo) = rest.strip_suffix("/tags/list") {
+            let tags: std::collections::BTreeSet<String> =
+                state.manifests.keys().filter_map(|k| k.strip_prefix(&format!("{repo}:"))).filter(|r| !r.starts_with("sha256:")).map(str::to_owned).collect();
+            Some(("tags", tags.into_iter().collect(), format!("/v2/{repo}/tags/list")))
+        } else {
+            None
+        };
+        if let Some((key, items, base)) = listing {
+            let last = query.split('&').find_map(|p| p.strip_prefix("last=")).unwrap_or_default();
+            let after: Vec<&String> = items.iter().filter(|i| last.is_empty() || i.as_str() > last).collect();
+            let page = if state.page_size == 0 { after.len() } else { state.page_size.min(after.len()) };
+            let shown: Vec<&String> = after[..page].to_vec();
+            let mut headers = Vec::new();
+            if page < after.len() {
+                headers.push(("Link", format!("<{base}?last={}&n={}>; rel=\"next\"", shown.last().unwrap(), state.page_size)));
+            }
+            let body = serde_json::to_vec(&json!({ key: shown })).unwrap();
+            return respond(&mut stream, "200 OK", &headers, &body, body.len(), true);
+        }
+        if let Some((repo, _)) = rest.split_once("/blobs/uploads/") {
+            if method == "POST" {
+                return respond(&mut stream, "202 Accepted", &[("Location", format!("/v2/{repo}/blobs/uploads/u1"))], b"", 0, false);
+            }
+            let digest = query.strip_prefix("digest=").unwrap_or_default().to_owned();
+            if method == "PUT" && digest == format!("sha256:{:x}", Sha256::digest(&body)) {
+                state.blobs.insert(digest, body);
+                return respond(&mut stream, "201 Created", &[], b"", 0, false);
+            }
+            return respond(&mut stream, "400 Bad Request", &[], b"bad digest", 10, true);
+        }
+        if let Some((_, digest)) = rest.split_once("/blobs/") {
+            return match state.blobs.get(digest) {
+                Some(b) => {
+                    let served = if state.corrupt.as_deref() == Some(digest) { b"corrupted".to_vec() } else { b.clone() };
+                    respond(&mut stream, "200 OK", &[], &served, served.len(), method != "HEAD")
+                }
+                None => respond(&mut stream, "404 Not Found", &[], b"", 0, false),
+            };
+        }
+        if let Some((repo, reference)) = rest.split_once("/manifests/") {
+            let key = format!("{repo}:{reference}");
+            if method == "PUT" {
+                let digest = format!("sha256:{:x}", Sha256::digest(&body));
+                state.manifests.insert(format!("{repo}:{digest}"), body.clone());
+                state.manifests.insert(key, body);
+                return respond(&mut stream, "201 Created", &[], b"", 0, false);
+            }
+            return match state.manifests.get(&key) {
+                Some(m) => respond(&mut stream, "200 OK", &[], m, m.len(), true),
+                None => respond(&mut stream, "404 Not Found", &[], b"{}", 2, true),
+            };
+        }
+        respond(&mut stream, "404 Not Found", &[], b"", 0, false);
+    }
+
+    // ------------------------------------------------------------ helpers
+
+    fn temp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("elpis-remote-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A store holding myteam/tool at `version`, with a payload (or none).
+    fn store_with(tag: &str, version: &str, payload: bool) -> (Store, Built) {
+        store_with_script(tag, version, payload, "echo hi")
+    }
+
+    fn store_with_script(tag: &str, version: &str, payload: bool, script: &str) -> (Store, Built) {
+        let src = temp(&format!("{tag}-src"));
+        let payload_yaml = if payload { "[{ from: ./agent, to: /opt/agent }]" } else { "[]" };
+        write(
+            &src.join("capsule.yaml"),
+            &format!("apiVersion: elpis.dev/v1alpha1\nkind: Capsule\nmetadata: {{ name: myteam/tool, version: {version}, description: a tool }}\nspec:\n  runtime: {{ image: {DIGEST}, entrypoint: [run] }}\n  payload: {payload_yaml}\n"),
+        );
+        write(&src.join("agent/run.sh"), &format!("#!/bin/sh\n{script}\n"));
+        let store = Store::at(temp(&format!("{tag}-store")));
+        let built = store.build(&src, false).unwrap();
+        (store, built)
+    }
+
+    fn client(m: &Mock, repo_and_tag: &str, login: Option<(&str, &str)>) -> Registry {
+        let r = Reference::parse(&format!("{}/{repo_and_tag}", m.addr)).unwrap();
+        Registry::with_login(r, login.map(|(u, p)| (u.to_owned(), p.to_owned())))
+    }
+
+    fn quiet(_: &str) {}
+
+    // ------------------------------------------------------------ tests
+
+    #[test]
+    fn a_pushed_capsule_pulls_back_identical() {
+        let m = mock(Auth::Open);
+        let (a, built) = store_with("rt-a", "1.0.0", true);
+        let pushed = push_to(&client(&m, "myteam/tool:1.0.0", None), &a, &built, false, &quiet).unwrap();
+        assert!(pushed.uploaded && pushed.digest.starts_with("sha256:"));
+        assert!(pushed.reference.ends_with("/myteam/tool:1.0.0"));
+
+        let b = Store::at(temp("rt-b-store"));
+        let got = pull_from(&client(&m, "myteam/tool:1.0.0", None), &b, false, &quiet).unwrap();
+        assert_eq!(got.digest, built.digest, "a pulled Capsule has the digest it was pushed with");
+        assert_eq!((got.payload_files, got.reference()), (1, "myteam/tool@1.0.0".to_owned()));
+        assert!(got.origin.unwrap().ends_with("/myteam/tool:1.0.0"));
+        assert_eq!(b.load(&b.find("myteam/tool").unwrap()).unwrap().reference(), "myteam/tool@1.0.0");
+        assert_eq!(std::fs::read(got.path.join("payload.tar.gz")).unwrap(), std::fs::read(built.path.join("payload.tar.gz")).unwrap());
+    }
+
+    #[test]
+    fn a_capsule_without_a_payload_uses_the_empty_layer() {
+        let m = mock(Auth::Open);
+        let (a, built) = store_with("np-a", "1.0.0", false);
+        push_to(&client(&m, "myteam/tool:1.0.0", None), &a, &built, false, &quiet).unwrap();
+        let got = pull_from(&client(&m, "myteam/tool:1.0.0", None), &Store::at(temp("np-b")), false, &quiet).unwrap();
+        assert!(got.payload_digest.is_none());
+        assert_eq!(got.digest, built.digest);
+    }
+
+    #[test]
+    fn pushing_twice_is_fine_but_a_release_is_immutable() {
+        let m = mock(Auth::Open);
+        let (store, built) = store_with("imm", "1.0.0", true);
+        let r = client(&m, "myteam/tool:1.0.0", None);
+        assert!(push_to(&r, &store, &built, false, &quiet).unwrap().uploaded);
+        assert!(!push_to(&r, &store, &built, false, &quiet).unwrap().uploaded, "same content: nothing to do");
+
+        // different content under the same version
+        let (other, changed) = store_with_script("imm2", "1.0.0", true, "echo changed");
+        assert_ne!(changed.digest, built.digest);
+        let e = format!("{:#}", push_to(&r, &other, &changed, false, &quiet).unwrap_err());
+        assert!(e.contains("immutable") && e.contains("--force"), "{e}");
+        assert!(push_to(&r, &other, &changed, true, &quiet).unwrap().uploaded);
+        let got = pull_from(&r, &Store::at(temp("imm-pull")), false, &quiet).unwrap();
+        assert_eq!(got.digest, changed.digest);
+    }
+
+    #[test]
+    fn basic_auth_needs_the_stored_login() {
+        let m = mock(Auth::Basic("Basic dXNlcjpwYXNz".into())); // user:pass
+        let (store, built) = store_with("basic", "1.0.0", true);
+        let e = format!("{:#}", push_to(&client(&m, "myteam/tool:1.0.0", None), &store, &built, false, &quiet).unwrap_err());
+        assert!(e.contains("secret set registry.127.0.0.1_"), "{e}");
+        push_to(&client(&m, "myteam/tool:1.0.0", Some(("user", "pass"))), &store, &built, false, &quiet).unwrap();
+        let wrong = format!("{:#}", push_to(&client(&m, "myteam/tool:1.0.1", Some(("user", "nope"))), &store, &built, false, &quiet).unwrap_err());
+        assert!(wrong.contains("401") || wrong.contains("not authorized"), "{wrong}");
+    }
+
+    #[test]
+    fn a_bearer_token_is_fetched_with_the_login() {
+        let m = mock(Auth::Bearer { login: "Basic dXNlcjpwYXNz".into(), realm: None });
+        let (store, built) = store_with("bearer", "1.0.0", true);
+        push_to(&client(&m, "myteam/tool:1.0.0", Some(("user", "pass"))), &store, &built, false, &quiet).unwrap();
+        // pulling needs the token too; the token service wants the login
+        assert!(pull_from(&client(&m, "myteam/tool:1.0.0", None), &Store::at(temp("bearer-anon")), false, &quiet).is_err());
+        pull_from(&client(&m, "myteam/tool:1.0.0", Some(("user", "pass"))), &Store::at(temp("bearer-pull")), false, &quiet).unwrap();
+    }
+
+    #[test]
+    fn a_token_service_over_plain_http_on_another_host_is_refused() {
+        let m = mock(Auth::Bearer { login: "Basic dXNlcjpwYXNz".into(), realm: Some("http://tokens.example.com/token".into()) });
+        let (store, built) = store_with("realm", "1.0.0", true);
+        let e = format!("{:#}", push_to(&client(&m, "myteam/tool:1.0.0", Some(("user", "pass"))), &store, &built, false, &quiet).unwrap_err());
+        assert!(e.contains("isn't HTTPS"), "{e}");
+    }
+
+    #[test]
+    fn something_that_is_not_a_capsule_is_refused() {
+        let m = mock(Auth::Open);
+        let image = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:x","size":1},"layers":[]}"#;
+        m.state.lock().unwrap().manifests.insert("myteam/tool:1.0.0".into(), image.to_vec());
+        let e = format!("{:#}", pull_from(&client(&m, "myteam/tool:1.0.0", None), &Store::at(temp("notcap")), false, &quiet).unwrap_err());
+        assert!(e.contains("isn't an Elpis Capsule"), "{e}");
+        let e = format!("{:#}", pull_from(&client(&m, "myteam/tool:9.9.9", None), &Store::at(temp("missing")), false, &quiet).unwrap_err());
+        assert!(e.contains("isn't in the registry"), "{e}");
+    }
+
+    #[test]
+    fn a_tag_or_repository_cannot_pass_one_capsule_off_as_another() {
+        let m = mock(Auth::Open);
+        let (store, built) = store_with("mis", "1.0.0", true);
+        push_to(&client(&m, "myteam/tool:1.0.0", None), &store, &built, false, &quiet).unwrap();
+        // the same manifest under another tag, and under another repository
+        {
+            let mut s = m.state.lock().unwrap();
+            let body = s.manifests["myteam/tool:1.0.0"].clone();
+            s.manifests.insert("myteam/tool:2.0.0".into(), body.clone());
+            s.manifests.insert("other/thing:1.0.0".into(), body);
+        }
+        let e = format!("{:#}", pull_from(&client(&m, "myteam/tool:2.0.0", None), &Store::at(temp("mis-a")), false, &quiet).unwrap_err());
+        assert!(e.contains("tag 2.0.0") && e.contains("version"), "{e}");
+        let e = format!("{:#}", pull_from(&client(&m, "other/thing:1.0.0", None), &Store::at(temp("mis-b")), false, &quiet).unwrap_err());
+        assert!(e.contains("doesn't belong in the repository"), "{e}");
+    }
+
+    #[test]
+    fn pulling_by_digest_pins_the_manifest() {
+        let m = mock(Auth::Open);
+        let (store, built) = store_with("pin", "1.0.0", true);
+        let pushed = push_to(&client(&m, "myteam/tool:1.0.0", None), &store, &built, false, &quiet).unwrap();
+        let got = pull_from(&client(&m, &format!("myteam/tool@{}", pushed.digest), None), &Store::at(temp("pin-b")), false, &quiet).unwrap();
+        assert_eq!(got.digest, built.digest);
+        // a registry that answers a digest with a different manifest is caught
+        let other = mock(Auth::Open);
+        let (s2, b2) = store_with("pin2", "1.0.0", false);
+        push_to(&client(&other, "myteam/tool:1.0.0", None), &s2, &b2, false, &quiet).unwrap();
+        {
+            let mut s = other.state.lock().unwrap();
+            let body = s.manifests["myteam/tool:1.0.0"].clone();
+            s.manifests.insert(format!("myteam/tool:{}", pushed.digest), body);
+        }
+        let e = format!("{:#}", pull_from(&client(&other, &format!("myteam/tool@{}", pushed.digest), None), &Store::at(temp("pin-c")), false, &quiet).unwrap_err());
+        assert!(e.contains("returned a manifest with digest"), "{e}");
+    }
+
+    #[test]
+    fn a_corrupted_blob_is_caught_by_its_digest() {
+        let m = mock(Auth::Open);
+        let (store, built) = store_with("cor", "1.0.0", true);
+        push_to(&client(&m, "myteam/tool:1.0.0", None), &store, &built, false, &quiet).unwrap();
+        m.state.lock().unwrap().corrupt = built.payload_digest.clone();
+        let e = format!("{:#}", pull_from(&client(&m, "myteam/tool:1.0.0", None), &Store::at(temp("cor-b")), false, &quiet).unwrap_err());
+        assert!(e.contains("digest mismatch"), "{e}");
+    }
+
+    #[test]
+    fn pulling_a_different_build_of_a_stored_version_needs_force() {
+        let m = mock(Auth::Open);
+        let (store, built) = store_with("pf", "1.0.0", true);
+        push_to(&client(&m, "myteam/tool:1.0.0", None), &store, &built, false, &quiet).unwrap();
+        // the local store has its own, different 1.0.0
+        let (local, _) = store_with("pf-local", "1.0.0", false);
+        let e = format!("{:#}", pull_from(&client(&m, "myteam/tool:1.0.0", None), &local, false, &quiet).unwrap_err());
+        assert!(e.contains("immutable") && e.contains("--force"), "{e}");
+        assert_eq!(pull_from(&client(&m, "myteam/tool:1.0.0", None), &local, true, &quiet).unwrap().digest, built.digest);
+    }
+
+    // ------------------------------------------------------------ signatures through the registry
+
+    fn signer() -> (Vec<u8>, String) {
+        let (pkcs8, public) = crate::capsulesign::generate().unwrap();
+        (pkcs8, crate::capsulesign::public_key_string(&public))
+    }
+
+    #[test]
+    fn signatures_travel_with_the_capsule_and_stay_untrusted_until_the_consumer_says() {
+        use crate::capsulesign::{Standing, Trust, sign, verify};
+        let m = mock(Auth::Open);
+        let (store, built) = store_with("sig-a", "1.0.0", true);
+        let (alice, alice_pub) = signer();
+        store.add_signature(&built, &sign(&alice, &built).unwrap()).unwrap();
+        let r = client(&m, "myteam/tool:1.0.0", None);
+        let pushed = push_to(&r, &store, &built, false, &quiet).unwrap();
+        assert_eq!(pushed.signatures, 1);
+        assert!(m.state.lock().unwrap().manifests.keys().any(|k| k.ends_with(&signatures_tag(&built.digest))));
+
+        let b = Store::at(temp("sig-b"));
+        let got = pull_from(&r, &b, false, &quiet).unwrap();
+        assert_eq!(b.signatures(&got).len(), 1);
+        assert_eq!(verify(&b, &got, &Trust::default()).signatures[0].standing, Standing::Unknown, "arriving from a registry earns no trust");
+        let mut trust = Trust::default();
+        trust.add("alice", &alice_pub, &["myteam".into()]).unwrap();
+        assert!(verify(&b, &got, &trust).is_trusted());
+    }
+
+    #[test]
+    fn signing_after_pushing_publishes_on_the_next_push_and_signers_accumulate() {
+        use crate::capsulesign::sign;
+        let m = mock(Auth::Open);
+        let (store, built) = store_with("sig-late", "1.0.0", true);
+        let r = client(&m, "myteam/tool:1.0.0", None);
+        let first = push_to(&r, &store, &built, false, &quiet).unwrap();
+        assert_eq!(first.signatures, 0);
+        assert!(!m.state.lock().unwrap().manifests.keys().any(|k| k.ends_with(".sig")), "unsigned: no signature tag");
+
+        let (alice, _) = signer();
+        store.add_signature(&built, &sign(&alice, &built).unwrap()).unwrap();
+        let again = push_to(&r, &store, &built, false, &quiet).unwrap();
+        assert!(!again.uploaded && again.signatures == 1, "the Capsule was already there; the signature still goes up");
+
+        // a second signer, from another machine's store, adds to the set instead of replacing it
+        let other = Store::at(temp("sig-other"));
+        let copy = pull_from(&r, &other, false, &quiet).unwrap();
+        let (bob, _) = signer();
+        other.add_signature(&copy, &sign(&bob, &copy).unwrap()).unwrap();
+        assert_eq!(push_to(&r, &other, &copy, false, &quiet).unwrap().signatures, 2);
+        assert_eq!(fetch_signatures(&r, &built.digest).unwrap().len(), 2);
+        // pushing the same set again changes nothing
+        assert_eq!(push_to(&r, &other, &copy, false, &quiet).unwrap().signatures, 2);
+    }
+
+    #[test]
+    fn pull_keeps_only_signatures_that_are_valid_for_this_capsule() {
+        use crate::capsulesign::sign;
+        let m = mock(Auth::Open);
+        let (store, built) = store_with("sig-junk", "1.0.0", true);
+        let r = client(&m, "myteam/tool:1.0.0", None);
+        push_to(&r, &store, &built, false, &quiet).unwrap();
+        // a registry holding a real signature for a different Capsule, and a forgery, under this Capsule's tag
+        let (carol, _) = signer();
+        let (_, elsewhere) = store_with("sig-junk-else", "2.0.0", true);
+        let foreign = sign(&carol, &elsewhere).unwrap();
+        let mut forged = sign(&carol, &built).unwrap();
+        forged.statement = forged.statement.replace("myteam/tool", "myteam/other");
+        let (dave, _) = signer();
+        let genuine = sign(&dave, &built).unwrap();
+        push_signatures(&r, &built.digest, &[foreign, forged, genuine.clone()]).unwrap();
+
+        let b = Store::at(temp("sig-junk-b"));
+        let got = pull_from(&r, &b, false, &quiet).unwrap();
+        assert_eq!(b.signatures(&got), vec![genuine]);
+    }
+
+    #[test]
+    fn a_signature_tag_that_is_not_a_signature_set_is_not_believed() {
+        let m = mock(Auth::Open);
+        let (store, built) = store_with("sig-wrong", "1.0.0", true);
+        let r = client(&m, "myteam/tool:1.0.0", None);
+        push_to(&r, &store, &built, false, &quiet).unwrap();
+        // the Capsule's own manifest, planted at the signature tag
+        {
+            let mut s = m.state.lock().unwrap();
+            let body = s.manifests["myteam/tool:1.0.0"].clone();
+            s.manifests.insert(format!("myteam/tool:{}", signatures_tag(&built.digest)), body);
+        }
+        assert!(fetch_signatures(&r, &built.digest).unwrap_err().to_string().contains("isn't an Elpis signature set"));
+        // pull still succeeds, reporting that it couldn't read signatures
+        let notes = std::cell::RefCell::new(Vec::new());
+        pull_from(&r, &Store::at(temp("sig-wrong-b")), false, &|l: &str| notes.borrow_mut().push(l.to_owned())).unwrap();
+        assert!(notes.borrow().iter().any(|l| l.contains("couldn't read signatures")));
+    }
+
+    // ------------------------------------------------------------ search
+
+    /// Push `myteam/<name>` at `version` with a description to a mock registry under `prefix`.
+    fn publish(m: &Mock, prefix: &str, name: &str, version: &str, description: &str, sign_with: Option<&[u8]>) {
+        let src = temp(&format!("pub-{name}-{version}-src"));
+        write(
+            &src.join("capsule.yaml"),
+            &format!("apiVersion: elpis.dev/v1alpha1\nkind: Capsule\nmetadata: {{ name: myteam/{name}, version: {version}, description: \"{description}\" }}\nspec:\n  runtime: {{ image: {DIGEST}, entrypoint: [run] }}\n"),
+        );
+        let store = Store::at(temp(&format!("pub-{name}-{version}-store")));
+        let built = store.build(&src, false).unwrap();
+        if let Some(key) = sign_with {
+            store.add_signature(&built, &crate::capsulesign::sign(key, &built).unwrap()).unwrap();
+        }
+        let r = client(m, &format!("{prefix}myteam/{name}:{version}"), None);
+        push_to(&r, &store, &built, false, &quiet).unwrap();
+    }
+
+    fn find(m: &Mock, prefix: &str, query: &str, all: bool) -> Result<Vec<Found>> {
+        search_in(&Registry::with_login(Reference::parse(&format!("{}/x", m.addr)).unwrap(), None), prefix, query, all, &quiet)
+    }
+
+    fn names(found: &[Found]) -> Vec<String> {
+        found.iter().map(|f| format!("{}@{}", f.name, f.version)).collect()
+    }
+
+    #[test]
+    fn search_matches_names_and_descriptions_and_shows_the_newest_version() {
+        let m = mock(Auth::Open);
+        publish(&m, "team/", "code-reviewer", "1.0.0", "Reviews a diff and writes comments", None);
+        publish(&m, "team/", "code-reviewer", "1.10.0", "Reviews a diff, faster", None);
+        publish(&m, "team/", "code-reviewer", "1.9.0", "older", None);
+        publish(&m, "team/", "release-notes", "0.3.0", "Drafts release notes from commits", None);
+        publish(&m, "team/", "triage", "2.0.0", "Sorts incoming issues", None);
+
+        // by description, case-insensitively, newest by version number (1.10.0 beats 1.9.0)
+        assert_eq!(names(&find(&m, "team", "REVIEWS diff", false).unwrap()), ["myteam/code-reviewer@1.10.0"]);
+        // by name
+        assert_eq!(names(&find(&m, "team", "notes", false).unwrap()), ["myteam/release-notes@0.3.0"]);
+        // every word has to match somewhere
+        assert!(find(&m, "team", "reviews banana", false).unwrap().is_empty());
+        // no query: everything, one version each
+        assert_eq!(names(&find(&m, "team", "", false).unwrap()), ["myteam/code-reviewer@1.10.0", "myteam/release-notes@0.3.0", "myteam/triage@2.0.0"]);
+        // all versions, in version order
+        assert_eq!(names(&find(&m, "team", "code-reviewer", true).unwrap()), ["myteam/code-reviewer@1.0.0", "myteam/code-reviewer@1.9.0", "myteam/code-reviewer@1.10.0"]);
+        let f = &find(&m, "team", "triage", false).unwrap()[0];
+        assert!(f.reference.ends_with("/team/myteam/triage:2.0.0") && f.reference.starts_with(&m.addr));
+        assert_eq!(f.description, "Sorts incoming issues");
+    }
+
+    #[test]
+    fn search_stays_inside_the_prefix_and_skips_what_is_not_a_capsule() {
+        let m = mock(Auth::Open);
+        publish(&m, "team-a/", "alpha", "1.0.0", "in a", None);
+        publish(&m, "team-b/", "beta", "1.0.0", "in b", None);
+        // an ordinary image with a semver tag, and a tag that isn't a version
+        {
+            let mut s = m.state.lock().unwrap();
+            s.manifests.insert("team-a/myteam/notacapsule:1.0.0".into(), br#"{"schemaVersion":2,"config":{"mediaType":"x","digest":"sha256:x","size":1},"layers":[]}"#.to_vec());
+            s.manifests.insert("team-a/myteam/alpha:latest".into(), b"{}".to_vec());
+            s.manifests.insert("flat:1.0.0".into(), b"{}".to_vec());
+        }
+        assert_eq!(names(&find(&m, "team-a", "", false).unwrap()), ["myteam/alpha@1.0.0"]);
+        assert_eq!(names(&find(&m, "team-b", "", false).unwrap()), ["myteam/beta@1.0.0"]);
+        assert_eq!(names(&find(&m, "", "", false).unwrap()), ["myteam/alpha@1.0.0", "myteam/beta@1.0.0"], "no prefix searches the whole registry");
+        assert!(find(&m, "team", "", false).unwrap().is_empty(), "a prefix is a path, not a string prefix: team doesn't cover team-a");
+    }
+
+    #[test]
+    fn search_follows_pages_and_reports_published_signatures() {
+        let m = mock(Auth::Open);
+        let (key, _) = signer();
+        for (i, name) in ["one", "two", "three", "four", "five"].iter().enumerate() {
+            publish(&m, "", name, "1.0.0", "page test", if i == 1 { Some(&key) } else { None });
+        }
+        m.state.lock().unwrap().page_size = 2;
+        let found = find(&m, "", "page", false).unwrap();
+        assert_eq!(found.len(), 5, "all three catalog pages were read");
+        let signed: Vec<&str> = found.iter().filter(|f| f.signatures_published).map(|f| f.name.as_str()).collect();
+        assert_eq!(signed, ["myteam/two"]);
+    }
+
+    #[test]
+    fn a_registry_without_a_catalog_says_how_to_proceed() {
+        let m = mock(Auth::Open);
+        m.state.lock().unwrap().no_catalog = true;
+        let e = format!("{:#}", find(&m, "", "x", false).unwrap_err());
+        assert!(e.contains("doesn't list its repositories") && e.contains("inspect --remote"), "{e}");
+    }
+
+    #[test]
+    fn search_uses_the_stored_login_and_asks_for_one_when_missing() {
+        let m = mock(Auth::Basic("Basic dXNlcjpwYXNz".into()));
+        let r = |login| Registry::with_login(Reference::parse(&format!("{}/x", m.addr)).unwrap(), login);
+        let e = format!("{:#}", search_in(&r(None), "", "", false, &quiet).unwrap_err());
+        assert!(e.contains("secret set registry."), "{e}");
+        assert!(search_in(&r(Some(("user".into(), "pass".into()))), "", "", false, &quiet).unwrap().is_empty());
+    }
+
+    #[test]
+    fn long_descriptions_are_cut_and_mislabeled_manifests_are_skipped() {
+        let m = mock(Auth::Open);
+        publish(&m, "", "wordy", "1.0.0", &"x".repeat(1000), None);
+        publish(&m, "", "honest", "1.0.0", "fine", None);
+        // the manifest at tag 1.0.0 of `liar` claims to be version 9.9.9
+        {
+            let mut s = m.state.lock().unwrap();
+            let body = String::from_utf8(s.manifests["myteam/honest:1.0.0"].clone()).unwrap().replace("\"org.opencontainers.image.version\":\"1.0.0\"", "\"org.opencontainers.image.version\":\"9.9.9\"");
+            s.manifests.insert("myteam/liar:1.0.0".into(), body.into_bytes());
+        }
+        let found = find(&m, "", "", false).unwrap();
+        assert_eq!(names(&found), ["myteam/honest@1.0.0", "myteam/wordy@1.0.0"]);
+        assert_eq!(found[1].description.chars().count(), 300);
+    }
+
+    #[test]
+    fn destinations_become_repositories() {
+        let (_, built) = store_with("dest", "1.0.0", false);
+        let r = reference_for("registry.example.com/team/", &built).unwrap();
+        assert_eq!((r.registry.as_str(), r.repository.as_str(), r.tag.as_str()), ("registry.example.com", "team/myteam/tool", "1.0.0"));
+        assert!(reference_for("https://registry.example.com", &built).is_err());
+        assert!(reference_for("", &built).is_err());
+    }
+
+    // ------------------------------------------------------------ untrusted payload archives
+
+    fn evil_tar(make: impl FnOnce(&mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>)) -> Vec<u8> {
+        let mut t = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()));
+        make(&mut t);
+        t.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn file_entry(t: &mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>, path: &str, mode: u32) {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(1);
+        h.set_mode(mode);
+        t.append_data(&mut h, path, &b"x"[..]).unwrap();
+    }
+
+    fn manifest_for_archive() -> Capsule {
+        Capsule::parse(&format!("apiVersion: elpis.dev/v1alpha1\nkind: Capsule\nmetadata: {{ name: a/b, version: 1.0.0 }}\nspec:\n  runtime: {{ image: {DIGEST}, entrypoint: [run] }}\n  payload: [{{ from: ./x, to: /opt/agent }}]\n")).unwrap()
+    }
+
+    fn check(gz: &[u8]) -> String {
+        match crate::capsulestore::validate_payload_archive(&manifest_for_archive(), gz) {
+            Ok(n) => format!("ok {n}"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    #[test]
+    fn archives_inside_the_targets_pass() {
+        assert_eq!(check(&evil_tar(|t| file_entry(t, "opt/agent/run.sh", 0o755))), "ok 1");
+        assert_eq!(check(&evil_tar(|_| {})), "ok 0");
+    }
+
+    #[test]
+    fn archives_outside_the_targets_or_with_odd_entries_are_refused() {
+        assert!(check(&evil_tar(|t| file_entry(t, "etc/passwd", 0o644))).contains("outside the manifest's payload targets"));
+        assert!(check(&evil_tar(|t| file_entry(t, "opt/agentx/f", 0o644))).contains("outside"), "a sibling folder with the same prefix is outside");
+        assert!(check(&evil_tar(|t| file_entry(t, "opt/agent/su", 0o4755))).contains("setuid"));
+        assert!(check(b"not a gzip").contains("gzipped tar") || check(b"not a gzip").contains("payload"));
+
+        let link = evil_tar(|t| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_link_name("/etc/shadow").unwrap();
+            t.append_data(&mut h, "opt/agent/l", std::io::empty()).unwrap();
+        });
+        assert!(check(&link).contains("only files and folders"));
+
+        // `..` can't be written through the tar crate's API, so put it in the header bytes directly
+        let traversal = evil_tar(|t| {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(1);
+            h.set_mode(0o644);
+            let name = b"opt/agent/../../etc/cron.d/x";
+            h.as_old_mut().name[..name.len()].copy_from_slice(name);
+            h.set_cksum();
+            t.append(&h, &b"x"[..]).unwrap();
+        });
+        assert!(check(&traversal).contains("`..`"), "{}", check(&traversal));
+    }
+
+    #[test]
+    fn a_payload_the_manifest_does_not_declare_is_refused() {
+        let (_, built) = store_with("undeclared", "1.0.0", false);
+        let manifest = std::fs::read(built.path.join("capsule.yaml")).unwrap();
+        let e = format!("{:#}", Store::at(temp("undeclared-b")).import(&manifest, Some(&evil_tar(|t| file_entry(t, "opt/agent/f", 0o644))), "x", false).unwrap_err());
+        assert!(e.contains("doesn't declare"), "{e}");
+        let (_, with) = store_with("declared", "1.0.0", true);
+        let manifest = std::fs::read(with.path.join("capsule.yaml")).unwrap();
+        let e = format!("{:#}", Store::at(temp("declared-b")).import(&manifest, None, "x", false).unwrap_err());
+        assert!(e.contains("declares a payload"), "{e}");
+    }
+
+    #[test]
+    fn builds_pass_their_own_validation() {
+        let (_, built) = store_with("self", "1.0.0", true);
+        let capsule = Capsule::parse(&std::fs::read_to_string(built.path.join("capsule.yaml")).unwrap()).unwrap();
+        let gz = std::fs::read(built.path.join("payload.tar.gz")).unwrap();
+        assert_eq!(crate::capsulestore::validate_payload_archive(&capsule, &gz).unwrap(), 1);
+    }
+}

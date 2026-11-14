@@ -2,16 +2,25 @@
 //!
 //! Each VM runs in its own async task that owns a [`elpis::Session`]; the UI talks to those tasks
 //! through Tauri commands and sees their log lines and state changes as Tauri events. Interactive
-//! terminals open in Windows Terminal running `elpis-run attach` against the VM's shim pipe.
+//! terminals open in Windows Terminal running `elpis-run attach` against the VM's shim pipe. The Capsules view
+//! (`capsules.rs`) is the same engine's Capsule workflow: browse, verify, run, pull, push, search, fork, sign, trust.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod boxes;
+mod capsules;
+mod help;
+
+use elpis::events::Activity;
+use elpis::netstack::{NetProbe, NetStats};
 use elpis::session::{debug_root, default_shim};
 use elpis::{Config, Log, Session};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Instant;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -22,6 +31,12 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[derive(Default)]
 struct AppState {
     vms: Mutex<HashMap<String, RunningVm>>,
+    /// Each box's traffic, kept after it stops so it stays visible
+    stats: std::sync::Mutex<HashMap<String, Arc<NetStats>>>,
+    /// Stopped boxes whose disk is open in a VM this app didn't start
+    elsewhere: std::sync::Mutex<HashSet<String>>,
+    /// The pull or create in progress, if any (one at a time)
+    job: std::sync::Mutex<Option<String>>,
 }
 
 /// A started VM, as the UI and the terminal button need it.
@@ -30,6 +45,17 @@ struct RunningVm {
     namespace: String,
     address: String,
     stop: mpsc::Sender<()>,
+    pid: Option<u32>,
+    started: Instant,
+    /// The VM's network: published ports, and "allow once" grants
+    net: Option<Arc<NetProbe>>,
+    /// Terminal sessions open in it (from any client), for auto-stop
+    activity: Arc<Activity>,
+    sample: Option<elpis::win::ProcessSample>,
+    cpu: f64,
+    ram: u64,
+    /// Auto-stop has already told it to stop
+    stopping: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -39,6 +65,8 @@ struct VmInfo {
     namespace: String,
     path: String,
     running: bool,
+    /// What the box was made from ("kit opencode", "capsule team/tool@1.0.0", …), if it says
+    source: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -82,6 +110,7 @@ async fn list_vms(state: State<'_, AppState>) -> Result<Vec<VmInfo>, String> {
             work: work.to_string_lossy().into_owned(),
             path: work.to_string_lossy().into_owned(),
             namespace: id.clone(),
+            source: elpis::boxfile::BoxFile::load(&work).map(|b| b.source),
             id,
         })
         .collect())
@@ -123,17 +152,39 @@ async fn start_vm(app: AppHandle, state: State<'_, AppState>, id: String, ports:
         return Err(format!("no work folder for {id}"));
     };
 
+    if elpis::workdir::file_busy(&work.join("rwlayer.img")) {
+        return Err(format!("{id}'s disk is open in another process (a VM started elsewhere, or one left running); end that VM first"));
+    }
     let mut config = Config::new(work.clone(), id.clone(), id.clone());
     config.host_ports = ports;
+    // through Elpis's network stack: internet, DNS, egress policy, the credential proxy, published ports and the activity view
+    config.network = true;
     config.shim_log = elpis::ShimLog::Warn;
     let log = ui_log(&app, &id);
 
     let session = Session::start(config, log).await.map_err(|e| format!("{e:#}"))?;
 
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    let net = session.network();
+    if let Some(n) = &net {
+        state.stats.lock().unwrap().insert(id.clone(), n.stats());
+    }
     state.vms.lock().await.insert(
         id.clone(),
-        RunningVm { work, namespace: id.clone(), address: session.address().to_owned(), stop: stop_tx },
+        RunningVm {
+            work,
+            namespace: id.clone(),
+            address: session.address().to_owned(),
+            stop: stop_tx,
+            pid: session.shim_pid(),
+            started: Instant::now(),
+            net,
+            activity: session.activity(),
+            sample: None,
+            cpu: 0.0,
+            ram: 0,
+            stopping: false,
+        },
     );
     let _ = app.emit("vm-state", VmState { id: id.clone(), running: true });
 
@@ -159,6 +210,14 @@ async fn stop_vm(state: State<'_, AppState>, id: String) -> Result<(), String> {
         let _ = vm.stop.send(()).await;
     }
     Ok(())
+}
+
+/// The shell command that opens a running box's agent (a kit's entrypoint, or a Capsule's).
+#[tauri::command]
+async fn agent_command(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    let vms = state.vms.lock().await;
+    let vm = vms.get(&id).ok_or("VM is not running")?;
+    elpis::workdir::agent_command(&vm.work).ok_or_else(|| "this box has no agent command: it wasn't made from a kit or a Capsule".to_owned())
 }
 
 /// Open an interactive terminal into the VM via Windows Terminal running `elpis-run attach`.
@@ -207,10 +266,13 @@ async fn open_terminal(state: State<'_, AppState>, id: String, command: String) 
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .manage(help::HelpState::default())
         .setup(|app| {
+            boxes::spawn_ticker(app.handle().clone());
             let show = MenuItem::with_id(app, "show", "Show elpis", true, None::<&str>)?;
+            let help = MenuItem::with_id(app, "help", "Help", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let menu = Menu::with_items(app, &[&show, &help, &quit])?;
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("elpis")
@@ -222,13 +284,75 @@ fn main() {
                             let _ = w.set_focus();
                         }
                     }
+                    // windows are made off the main thread, as Tauri asks
+                    "help" => {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = help::show(&app, None).await;
+                        });
+                    }
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_vms, shim_info, start_vm, stop_vm, open_terminal])
+        .invoke_handler(tauri::generate_handler![
+            list_vms,
+            shim_info,
+            start_vm,
+            stop_vm,
+            open_terminal,
+            agent_command,
+            boxes::box_cards,
+            boxes::net_activity,
+            boxes::policy_get,
+            boxes::policy_add,
+            boxes::policy_remove,
+            boxes::policy_default,
+            boxes::net_mark_host,
+            boxes::net_answer,
+            boxes::ports_list,
+            boxes::port_add,
+            boxes::port_remove,
+            boxes::fs_list,
+            boxes::fs_toggle,
+            boxes::auto_stop_toggle,
+            boxes::kit_catalog,
+            boxes::kit_pull,
+            boxes::box_create,
+            boxes::new_box_defaults,
+            boxes::template_list,
+            boxes::template_save,
+            boxes::template_remove,
+            boxes::box_delete,
+            help::open_help,
+            help::help_pages,
+            help::help_page,
+            help::help_search,
+            help::help_take_topic,
+            capsules::capsule_list,
+            capsules::capsule_verify_all,
+            capsules::capsule_detail,
+            capsules::capsule_remove,
+            capsules::capsule_build,
+            capsules::capsule_prepare_run,
+            capsules::capsule_run,
+            capsules::capsule_search,
+            capsules::capsule_inspect_remote,
+            capsules::capsule_pull,
+            capsules::capsule_push,
+            capsules::capsule_fork,
+            capsules::capsule_default_fork_dir,
+            capsules::capsule_default_registry,
+            capsules::capsule_keys,
+            capsules::capsule_keygen,
+            capsules::capsule_sign,
+            capsules::capsule_trust,
+            capsules::capsule_trust_add,
+            capsules::capsule_trust_remove,
+            capsules::capsule_trust_require,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running elpis-gui");
 }

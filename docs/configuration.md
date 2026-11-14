@@ -12,6 +12,7 @@ Set these in the environment of the program you run (`elpis-run`, `elpis-tui`, `
 | `ELPIS_SHIM` | `krun` when Elpis's guest is installed, else `sbx` | Which shim: `krun` (`elpis-shim.exe` beside the program), `sbx` (Docker Sandboxes' installed shim) or a path. `--shim` overrides it per command. |
 | `ELPIS_MKFS` | `vm` when the guest is installed, else `sbx` | How layers and disks are formatted: in a tools VM, or with Docker Sandboxes' `mkfs.*.exe` |
 | `ELPIS_DNS` | the host's first resolver, else `1.1.1.1` | Upstream DNS server (an IP) |
+| `ELPIS_CAPSULE_REGISTRY` | unset | Registry (`REGISTRY[/PREFIX]`) that `capsule search` searches instead of your store; `--registry` overrides it and `--local` ignores it |
 | `ELPIS_NET_DEBUG` | unset | Log IPv4 and ARP frames in both directions (very verbose) |
 
 ### Shim
@@ -36,7 +37,10 @@ Set these in the environment of the program you run (`elpis-run`, `elpis-tui`, `
 | `images\` | Pulled image manifests and configs; `images\layers\` holds converted erofs layers, shared by digest |
 | `kits\` | Cached kit specs |
 | `templates\` | Saved templates |
+| `capsules\NAMESPACE\NAME\VERSION\` | Built Capsules: `capsule.yaml` as written, `payload.tar.gz`, `build.json` with the digests and git provenance, and `signatures\KEYID.json` |
+| `capsules\.layers\` | Payloads converted to erofs layers by `capsule run`, shared by boxes from the same build |
 | `proxy\` | The credential proxy's CA (`ca.pem`, `ca.key.pem`) |
+| `capsule-trust.json` | Your Capsule signing policy: trusted public keys with their namespaces, and whether `capsule run` requires a signature |
 
 Moving the whole folder is safe while no box is running; point `ELPIS_HOME` at the new place.
 
@@ -49,6 +53,7 @@ Moving the whole folder is safe while no box is running; point `ELPIS_HOME` at t
 | `rwlayer.img` | The writable layer: sparse ext4 with a journal |
 | `box.json` | Where the box came from (kit, image, template), the agent command, workspace, Docker, ports, auto-stop, kit setup steps |
 | `network-policy.json` | Egress policy (created on first use) |
+| `capsule.lock` | Boxes made by `capsule run`: the Capsule and digest, what it requested, and what was granted |
 | `docker.img` | Docker's disk at `/var/lib/docker`, for boxes with Docker |
 | `vol-N.img` | Sized volumes a kit asks for |
 | `net.sock`, `sockets\` | The NIC socket and host-port sockets, while running |

@@ -10,7 +10,13 @@
 //! Inputs: <work>\bundle\config.json, <work>\rootfs.json, <work>\rwlayer.img, made by hand or by
 //! [`workdir::create_box`] from an sbx kit ([`kits`]), a pulled image ([`registry`]) or a template.
 
+pub mod b64;
 pub mod boxfile;
+pub mod capsule;
+pub mod capsuleremote;
+pub mod capsulerun;
+pub mod capsulesign;
+pub mod capsulestore;
 pub mod console;
 pub mod credproxy;
 pub mod events;

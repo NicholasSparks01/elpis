@@ -62,6 +62,11 @@ enum Command {
         #[command(subcommand)]
         action: TemplateAction,
     },
+    /// Build, run, share, sign and verify Capsules: portable agent packages (see docs/capsules.md)
+    Capsule {
+        #[command(subcommand)]
+        action: CapsuleAction,
+    },
     /// Hosts a running box is waiting on (policy default "ask"); answer with `policy --work … allow|deny HOST`
     Approvals { r#box: String },
     /// Run a command in a box, like `sbx exec` (starting the box for it if it isn't running)
@@ -196,6 +201,157 @@ enum SecretAction {
     Rm { service: String },
 }
 
+#[derive(Args)]
+struct CapsuleRunArgs {
+    /// NAME or NAME@VERSION of a built Capsule
+    reference: String,
+    /// Folder to share as the workspace [default: the current folder, for a Capsule that has a workspace]
+    workspace: Option<PathBuf>,
+    /// Box name [default: CAPSULE-FOLDER]
+    #[arg(long)]
+    name: Option<String>,
+    /// Grant everything the Capsule asks for without asking
+    #[arg(long)]
+    yes: bool,
+    /// Run it even though your trust policy requires a signature from a trusted key and it has none
+    #[arg(long)]
+    allow_unsigned: bool,
+    /// Open a shell instead of the agent
+    #[arg(long)]
+    shell: bool,
+    #[arg(long)]
+    cpus: Option<u32>,
+    /// Memory in MB
+    #[arg(long)]
+    memory: Option<u64>,
+    /// Publish a port the Capsule declares to Windows: [IP:]HOST:BOX, e.g. 8080:3000 (repeatable)
+    #[arg(short = 'p', long = "publish", value_name = "[IP:]HOST:BOX")]
+    publish: Vec<String>,
+    /// Stop the box this many seconds after its last terminal closes; 0 keeps it running [default: the Capsule's]
+    #[arg(long, value_name = "SECONDS")]
+    auto_stop: Option<u64>,
+}
+
+#[derive(Subcommand)]
+enum TrustAction {
+    /// Trust a public key to vouch for Capsules in the named namespaces
+    Add {
+        /// A label for it in reports
+        name: String,
+        /// ed25519:… as printed by the signer's `capsule keygen` / `capsule keys`
+        public_key: String,
+        /// A namespace this key may vouch for (repeatable); '*' for all. Required: a key trusted for one team
+        /// must not be able to vouch for another's Capsules
+        #[arg(long = "namespace", required = true, value_name = "NS")]
+        namespaces: Vec<String>,
+    },
+    /// List trusted keys and the policy
+    Ls,
+    /// Stop trusting a key
+    Rm { name: String },
+    /// `on`: `capsule run` refuses Capsules without a signature from a trusted key; `off`: it only says so
+    Require { mode: String },
+}
+
+#[derive(Subcommand)]
+enum CapsuleAction {
+    /// Validate a Capsule folder and store it as NAME@VERSION (a version is immutable)
+    Build {
+        /// The Capsule folder, or its capsule.yaml
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// Replace this version if it was built with different content
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show what a Capsule runs and what it asks for: a built NAME[@VERSION], a folder, or with --remote a registry reference
+    Inspect {
+        target: String,
+        /// Print the manifest as JSON
+        #[arg(long)]
+        json: bool,
+        /// TARGET is REGISTRY/NAMESPACE/NAME:VERSION; reads only the manifest, not the payload
+        #[arg(long)]
+        remote: bool,
+    },
+    /// List built Capsules
+    #[command(alias = "list")]
+    Ls,
+    /// Make a box from a built Capsule (asking what to grant it) and open its agent
+    Run(CapsuleRunArgs),
+    /// Find Capsules by words in their names and descriptions: in your store, or with --registry in a registry
+    Search {
+        /// Words to look for; all of them must match
+        query: Vec<String>,
+        /// Search this registry (REGISTRY or REGISTRY/PREFIX) instead of your store. Needs a registry that lists
+        /// its repositories. Defaults to $ELPIS_CAPSULE_REGISTRY when that is set
+        #[arg(long)]
+        registry: Option<String>,
+        /// Search your store even if a registry is set
+        #[arg(long, conflicts_with = "registry")]
+        local: bool,
+        /// Every version (up to 10 per Capsule), not just the newest
+        #[arg(long)]
+        all_versions: bool,
+    },
+    /// Start your own Capsule from one: an editable folder with its lineage recorded (a registry reference is pulled first)
+    Fork {
+        /// NAME[@VERSION] of a built Capsule, or REGISTRY/NAMESPACE/NAME:VERSION to pull and fork
+        source: String,
+        /// The fork's name: NAMESPACE/NAME, different from the original's
+        name: String,
+        /// Where to write the folder [default: ./NAME]
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// The fork's version [default: 0.1.0]
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Make a signing key: the private half goes into Credential Manager, the public key is printed to share
+    Keygen { name: String },
+    /// List this machine's signing keys with their public keys
+    Keys,
+    /// Sign a built Capsule: vouch for its exact contents and the git state it was built from
+    Sign {
+        /// NAME@VERSION of a built Capsule
+        reference: String,
+        /// The signing key's name (see `capsule keys`)
+        #[arg(long)]
+        key: String,
+    },
+    /// Check a built Capsule: its files, its payload, and its signatures against your trust policy
+    Verify {
+        reference: String,
+        /// Fail unless a key you trust has signed it (your policy's `require` setting already does this when on)
+        #[arg(long)]
+        require_signed: bool,
+    },
+    /// Choose whose signatures you trust
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
+    /// Upload a built Capsule to an OCI registry as REGISTRY[/PREFIX]/NAMESPACE/NAME:VERSION
+    Push {
+        /// NAME@VERSION of a built Capsule
+        reference: String,
+        /// Registry, with an optional path: registry.example.com or registry.example.com/team
+        to: String,
+        /// Overwrite a release that exists with different content
+        #[arg(long)]
+        force: bool,
+    },
+    /// Download a Capsule from a registry into the local store (REGISTRY/NAMESPACE/NAME:VERSION, or @sha256:… to pin)
+    Pull {
+        reference: String,
+        /// Replace a stored version that has different content
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove one built version (NAME@VERSION)
+    Rm { reference: String },
+}
+
 #[derive(Subcommand)]
 enum TemplateAction {
     /// Save a stopped box as a template
@@ -315,6 +471,7 @@ fn main() {
                 0
             }),
             Some(Command::Template { action }) => template(action),
+            Some(Command::Capsule { action }) => capsule(action, &log).await,
             Some(Command::Secret { action }) => secret(action),
             Some(Command::Ports { r#box, publish, unpublish }) => ports(&r#box, &publish, &unpublish),
             Some(Command::Exec(args)) => exec(args).await,
@@ -770,6 +927,310 @@ fn template(action: TemplateAction) -> Result<i32> {
     Ok(0)
 }
 
+async fn capsule(action: CapsuleAction, log: &Log) -> Result<i32> {
+    use elpis::capsule::Capsule;
+    use elpis::capsulestore::{Store, short};
+    let store = Store::open();
+    match action {
+        CapsuleAction::Run(args) => return capsule_run(args, log).await,
+        CapsuleAction::Search { query, registry, local, all_versions } => {
+            let query = query.join(" ");
+            let registry = registry.or_else(|| std::env::var("ELPIS_CAPSULE_REGISTRY").ok().filter(|r| !r.trim().is_empty())).filter(|_| !local);
+            match registry {
+                Some(registry) => {
+                    let (q, r) = (query.clone(), registry.clone());
+                    let found = tokio::task::spawn_blocking(move || elpis::capsuleremote::search(&r, &q, all_versions, &progress)).await??;
+                    for f in &found {
+                        println!("  {}{}", f.reference, if f.signatures_published { "   (signatures published)" } else { "" });
+                        if !f.description.is_empty() {
+                            println!("      {}", elpis::capsule::display_safe(&f.description));
+                        }
+                    }
+                    if found.is_empty() {
+                        println!("  nothing in {registry} matches {query:?}");
+                    } else {
+                        println!("\n  Descriptions come from the registry and are unchecked. Look before you pull: `elpis-run capsule inspect --remote REF`.");
+                        println!("  \"signatures published\" only means someone signed it; after `capsule pull`, `capsule verify` says whether you trust them.");
+                    }
+                }
+                None => {
+                    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+                    for b in store.list() {
+                        let text = format!("{} {}", b.name, b.description).to_lowercase();
+                        if words.iter().all(|w| text.contains(w.as_str())) {
+                            println!("  {:<36} {}  {}{}", b.reference(), short(&b.digest), elpis::capsule::display_safe(&b.description), b.origin.as_ref().map_or(String::new(), |o| format!("  (from {})", elpis::capsule::display_safe(o))));
+                        }
+                    }
+                }
+            }
+        }
+        CapsuleAction::Fork { source, name, dir, version } => {
+            // REGISTRY/NAMESPACE/NAME:VERSION has two or more slashes; NAME[@VERSION] has one
+            let built = if source.matches('/').count() >= 2 {
+                println!("pulling {source}");
+                let src = source.clone();
+                tokio::task::spawn_blocking(move || elpis::capsuleremote::pull(&Store::open(), &src, false, &progress)).await??
+            } else {
+                store.find(&source)?
+            };
+            let dest = std::path::absolute(dir.unwrap_or_else(|| PathBuf::from(name.rsplit('/').next().unwrap_or("capsule"))))?;
+            let forked = store.fork(&built, &name, version.as_deref(), &dest)?;
+            println!("forked {} → {}@{}", forked.parent, forked.name, forked.version);
+            println!("  folder   {}  ({} payload file(s))", forked.dir.display(), forked.files);
+            match elpis::capsulesign::Trust::load() {
+                Ok(trust) => println!("  original {}", standing_line(&elpis::capsulesign::verify(&store, &built, &trust))),
+                Err(e) => println!("  original: couldn't read your trust policy: {e:#}"),
+            }
+            println!("  Edit capsule.yaml and the files, then `elpis-run capsule build {}`; sign and push it to share it.", forked.dir.display());
+            println!("  It is a new, unsigned Capsule: the original's signatures don't apply to it. YAML comments aren't kept, and executable");
+            println!("  bits come back only for .sh files and #! scripts (Windows has none to read).");
+        }
+        CapsuleAction::Keygen { name } => {
+            let public = elpis::capsulesign::create_key(&name)?;
+            println!("created the signing key {name}");
+            println!("  public key  {public}");
+            println!("  The private key stays in Credential Manager (elpis/capsule-key.{name}). Share the public key;");
+            println!("  others trust it with `elpis-run capsule trust add {name} {public} --namespace NS`.");
+        }
+        CapsuleAction::Keys => {
+            for (name, public) in elpis::capsulesign::keys() {
+                println!("  {name:<24} {public}");
+            }
+        }
+        CapsuleAction::Sign { reference, key } => {
+            let built = store.find(&reference)?;
+            store.load(&built)?; // don't vouch for files that no longer match their build
+            let record = elpis::capsulesign::sign(&elpis::capsulesign::load_key(&key)?, &built)?;
+            store.add_signature(&built, &record)?;
+            println!("signed {} with {key} (key id {})", built.reference(), record.key_id);
+            match &built.provenance {
+                None => println!("  no git provenance: it wasn't built from a git repository, so the signature says nothing about its source"),
+                Some(p) if p.dirty => println!("  note: it was built from a folder with uncommitted changes, so commit {} doesn't fully describe it", p.commit.as_deref().unwrap_or("?")),
+                Some(p) => println!("  source: {} @ {}", p.git.as_deref().unwrap_or("(no remote)"), p.commit.as_deref().unwrap_or("?")),
+            }
+            println!("  `capsule push {} REGISTRY` publishes the signature with the Capsule", built.reference());
+        }
+        CapsuleAction::Verify { reference, require_signed } => {
+            let trust = elpis::capsulesign::Trust::load()?;
+            let built = store.find(&reference)?;
+            let report = elpis::capsulesign::verify(&store, &built, &trust);
+            print_report(&report);
+            let needs_signature = require_signed || trust.require_signed;
+            return Ok(if !report.intact() || (needs_signature && !report.is_trusted()) { 1 } else { 0 });
+        }
+        CapsuleAction::Trust { action } => {
+            use elpis::capsulesign::Trust;
+            let mut trust = Trust::load()?;
+            match action {
+                TrustAction::Add { name, public_key, namespaces } => {
+                    trust.add(&name, &public_key, &namespaces)?;
+                    trust.save()?;
+                    println!("trusting {name} for {}", namespaces.join(", "));
+                }
+                TrustAction::Ls => {
+                    println!("  signatures required to run: {}", if trust.require_signed { "yes" } else { "no" });
+                    for k in &trust.keys {
+                        println!("  {:<20} {}  for {}", k.name, k.public_key, k.namespaces.join(", "));
+                    }
+                }
+                TrustAction::Rm { name } => {
+                    if !trust.remove(&name) {
+                        anyhow::bail!("no trusted key named {name} (`capsule trust ls` lists them)");
+                    }
+                    trust.save()?;
+                    println!("no longer trusting {name}");
+                }
+                TrustAction::Require { mode } => {
+                    trust.require_signed = match mode.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        other => anyhow::bail!("{other:?}: say `on` or `off`"),
+                    };
+                    trust.save()?;
+                    println!("`capsule run` now {} a signature from a trusted key", if trust.require_signed { "requires" } else { "doesn't require" });
+                }
+            }
+        }
+        CapsuleAction::Build { dir, force } => {
+            let b = store.build(&dir, force)?;
+            println!("built {}", b.reference());
+            println!("  digest   {}", short(&b.digest));
+            if b.payload_digest.is_some() {
+                println!("  payload  {} file(s), {:.1} KB compressed", b.payload_files, b.payload_bytes as f64 / 1024.0);
+            }
+            println!("  stored   {}", b.path.display());
+        }
+        CapsuleAction::Push { reference, to, force } => {
+            let spec = reference.clone();
+            let pushed = tokio::task::spawn_blocking(move || elpis::capsuleremote::push(&Store::open(), &spec, &to, force, &progress)).await??;
+            println!("{} {}", if pushed.uploaded { "pushed" } else { "already there:" }, pushed.reference);
+            println!("  digest   {}", pushed.digest);
+            println!("  signed   {}", if pushed.signatures == 0 { "no signatures (`capsule sign`, then push again)".to_owned() } else { format!("{} signature(s) in the registry", pushed.signatures) });
+            println!("  pin it:  elpis-run capsule pull {}@{}", pushed.reference.rsplit_once(':').map_or(pushed.reference.as_str(), |(r, _)| r), pushed.digest);
+            println!("  Anyone who can write this tag can replace it; signatures and the pinned form above let others tell.");
+        }
+        CapsuleAction::Pull { reference, force } => {
+            let built = tokio::task::spawn_blocking(move || elpis::capsuleremote::pull(&Store::open(), &reference, force, &progress)).await??;
+            println!("pulled {}", built.reference());
+            println!("  digest   {}", short(&built.digest));
+            println!("  stored   {}", built.path.display());
+            match elpis::capsulesign::Trust::load() {
+                Ok(trust) => println!("  {}", standing_line(&elpis::capsulesign::verify(&store, &built, &trust))),
+                Err(e) => println!("  couldn't read your trust policy: {e:#}"),
+            }
+            println!("  nothing runs until you `capsule run` it, and that asks what to grant; `capsule verify {0}` and `capsule inspect {0}` show more", built.reference());
+        }
+        CapsuleAction::Inspect { target, json, remote: true } => {
+            let (capsule, digest) = tokio::task::spawn_blocking(move || elpis::capsuleremote::inspect(&target)).await??;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&capsule)?);
+            } else {
+                print!("{}", capsule.summary(Some(&format!("registry manifest {digest}"))));
+            }
+        }
+        CapsuleAction::Inspect { target, json, remote: false } => {
+            // a folder or capsule.yaml on disk, else a built Capsule
+            let on_disk = Path::new(&target);
+            let (capsule, digest) = if on_disk.join("capsule.yaml").is_file() || on_disk.is_file() {
+                (Capsule::load(on_disk)?, None)
+            } else {
+                let built = store.find(&target)?;
+                (store.load(&built)?, Some(built.digest))
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&capsule)?);
+            } else {
+                print!("{}", capsule.summary(digest.as_deref()));
+            }
+        }
+        CapsuleAction::Ls => {
+            for b in store.list() {
+                println!(
+                    "  {:<36} {}  {:>3} file(s)  {}{}",
+                    b.reference(),
+                    short(&b.digest),
+                    b.payload_files,
+                    elpis::capsule::display_safe(&b.description),
+                    b.origin.as_ref().map_or(String::new(), |o| format!("  (from {})", elpis::capsule::display_safe(o)))
+                );
+            }
+        }
+        CapsuleAction::Rm { reference } => {
+            let b = store.remove(&reference)?;
+            println!("removed {}", b.reference());
+        }
+    }
+    Ok(0)
+}
+
+/// One line on who vouches for a Capsule, in terms of the consumer's policy.
+fn standing_line(report: &elpis::capsulesign::Report) -> String {
+    report.verdict()
+}
+
+fn print_report(report: &elpis::capsulesign::Report) {
+    use elpis::capsulesign::Standing;
+    println!("{}  {}", report.reference, elpis::capsulestore::short(&report.digest));
+    for c in &report.checks {
+        match &c.result {
+            Ok(detail) => println!("  ok    {} ({detail})", c.name),
+            Err(why) => println!("  FAIL  {}: {why}", c.name),
+        }
+    }
+    match &report.provenance {
+        None => println!("  source: not recorded (it wasn't built from a git repository)"),
+        Some(p) => println!(
+            "  source: {} @ {}{}",
+            p.git.as_deref().unwrap_or("(no remote)"),
+            p.commit.as_deref().unwrap_or("?"),
+            if p.dirty { "  (built with uncommitted changes)" } else { "" }
+        ),
+    }
+    if report.signatures.is_empty() {
+        println!("  signatures: none");
+    }
+    for s in &report.signatures {
+        let what = match &s.standing {
+            Standing::Trusted(name) => format!("valid, by {name}, whom you trust for this namespace"),
+            Standing::OutOfScope(name) => format!("valid, by {name}, but you don't trust that key for this namespace"),
+            Standing::Unknown => format!("valid, by a key you haven't trusted ({})", s.public_key),
+            Standing::Invalid(why) => format!("INVALID: {why}"),
+        };
+        println!("  signature {}: {what}", s.key_id);
+    }
+    println!("  verdict: {}", standing_line(report));
+}
+
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+/// Run a built Capsule: verify it, show what it asks for and ask what to grant, pull its image, make a box
+/// whose network policy is exactly the grants, and open the agent. An existing box from the same build is reused.
+async fn capsule_run(args: CapsuleRunArgs, log: &Log) -> Result<i32> {
+    use elpis::capsule::Lock;
+    use elpis::capsulerun;
+    use elpis::capsulestore::Store;
+
+    let store = Store::open();
+    let built = store.find(&args.reference)?;
+    // Loads the Capsule (checking its files against the build) and applies the consumer's trust policy, before
+    // anything is asked or created
+    let prepared = capsulerun::prepare(&store, &built, args.allow_unsigned)?;
+    let capsule = &prepared.capsule;
+
+    let workspace = capsulerun::workspace_for(capsule, args.workspace.as_deref(), &std::env::current_dir()?)?;
+    let name = args.name.clone().unwrap_or_else(|| capsulerun::default_box_name(capsule, workspace.as_deref()));
+    if name.is_empty() {
+        anyhow::bail!("couldn't make a box name; pass --name");
+    }
+
+    let work = debug_root().join(&name);
+    if work.join(r"bundle\config.json").exists() {
+        return match Lock::load(&work) {
+            Some(lock) if lock.digest == built.digest => {
+                println!("using box {name} ({})", lock.capsule);
+                start_and_open(&work, args.shell, log).await
+            }
+            Some(lock) => anyhow::bail!("box {name} was made from {} with different content; `elpis-run rm {name}` it, or pass --name", lock.capsule),
+            None => anyhow::bail!("a box named {name} already exists and wasn't made from a Capsule; pass --name"),
+        };
+    }
+
+    let ports = args.publish.iter().map(|p| PortMap::parse(p)).collect::<Result<Vec<_>>>()?;
+    capsule.to_boxfile(&ports)?; // a published port has to be one the Capsule declares; fail before asking anything
+
+    // Requests are not grants: show what would be granted, and nothing is created until it's approved
+    let requests = &capsule.spec.requests;
+    let grants = prepared.requested();
+    println!("{}: {}", capsule.reference(), standing_line(&prepared.report));
+    println!("  asks for:");
+    if grants.network.is_empty() {
+        println!("  network   none (the box will be offline)");
+    } else {
+        println!("  network   {}", grants.network.join(", "));
+    }
+    if grants.host_access {
+        println!("  host      access to this Windows machine's services");
+    }
+    if !requests.credentials.is_empty() {
+        let services: Vec<&str> = requests.credentials.iter().map(|c| c.service.as_str()).collect();
+        println!("  credentials requested ({}) are not injected yet; the agent has to sign in itself", services.join(", "));
+    }
+    if !args.yes && !confirm("Grant these?")? {
+        anyhow::bail!("not granted; nothing was created");
+    }
+
+    let opts = capsulerun::Options { name, workspace, ports, cpus: args.cpus, memory_mb: args.memory, auto_stop: args.auto_stop, grants };
+    let work = tokio::task::spawn_blocking(move || capsulerun::create_box(&Store::open(), prepared, opts, &progress)).await??;
+    start_and_open(&work, args.shell, log).await
+}
+
 fn ports(name: &str, publish: &[String], unpublish: &[u16]) -> Result<i32> {
     let work = box_path(name)?;
     let mut file = BoxFile::load_or_default(&work);
@@ -821,4 +1282,33 @@ fn approvals(name: &str) -> Result<i32> {
         println!("\nanswer with: elpis-run policy --work {} allow|deny HOST  (applies on the box's next retry)", work.display());
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    /// The command-line reference (`docs/cli.md`, also shown in the GUI's Help window) has to mention every command,
+    /// so adding one without documenting it fails here.
+    #[test]
+    fn the_cli_reference_documents_every_command() {
+        fn walk(cmd: &clap::Command, path: &str, doc: &str, missing: &mut Vec<String>) {
+            for sub in cmd.get_subcommands() {
+                let name = sub.get_name();
+                if name == "help" {
+                    continue;
+                }
+                let full = if path.is_empty() { name.to_owned() } else { format!("{path} {name}") };
+                if sub.has_subcommands() {
+                    walk(sub, &full, doc, missing);
+                } else if !doc.contains(&format!("`{full}")) {
+                    missing.push(full);
+                }
+            }
+        }
+        let doc = include_str!("../../../docs/cli.md");
+        let mut missing = Vec::new();
+        walk(&super::Cli::command(), "", doc, &mut missing);
+        assert!(missing.is_empty(), "docs/cli.md doesn't document: {missing:?} (write each as `command ...` in a heading or table row)");
+    }
 }

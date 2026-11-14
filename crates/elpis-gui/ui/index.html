@@ -3,166 +3,279 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>elpis</title>
+<meta name="color-scheme" content="dark light" />
+<title>Elpis</title>
+<link rel="icon" type="image/png" href="logo.png" />
+<link rel="stylesheet" href="theme.css" />
 <style>
-  :root {
-    --bg: #1a1b26; --panel: #1f2335; --panel2: #24283b; --border: #2a2e45;
-    --fg: #c0caf5; --dim: #565f89; --accent: #7aa2f7; --green: #9ece6a;
-    --red: #f7768e; --yellow: #e0af68; --cyan: #7dcfff; --magenta: #bb9af7;
-  }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; height: 100%; }
-  body {
-    background: var(--bg); color: var(--fg); font: 13px/1.5 "Segoe UI", system-ui, sans-serif;
-    display: grid; grid-template-columns: 300px 1fr; grid-template-rows: 1fr auto; height: 100vh;
-  }
-  #sidebar { grid-row: 1 / 3; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
-  .brand { padding: 14px 16px; font-weight: 600; font-size: 15px; letter-spacing: .3px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
-  .brand .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
-  #vmlist { overflow-y: auto; flex: 1; padding: 6px; }
-  .vm { padding: 10px 12px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; border: 1px solid transparent; }
-  .vm:hover { background: var(--panel2); }
-  .vm.active { background: var(--panel2); border-color: var(--accent); }
-  .vm .name { font-weight: 600; display: flex; align-items: center; gap: 7px; }
-  .vm .state { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
-  .vm.running .state { background: var(--green); box-shadow: 0 0 6px var(--green); }
-  .vm .path { color: var(--dim); font-size: 11px; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* the main window's layout; colours and controls come from theme.css */
+  body { display: grid; grid-template-columns: 248px 1fr; height: 100vh; }
+
+
+  /* sidebar: the brand and the boxes */
+  #sidebar { background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+  .brand { padding: 14px 14px 12px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
+  .brand .logo { width: 28px; height: 28px; border-radius: 7px; flex: none; }
+  .brand b { font-size: 15px; font-weight: 600; letter-spacing: .02em; flex: 1; }
+  .brand .help-q { margin-right: 2px; }
+  #theme { padding: 3px 7px; font-size: 13px; line-height: 1; background: transparent; border-color: transparent; color: var(--dim); }
+  .sidehead { padding: 12px 14px 4px; color: var(--dim); font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; display: flex; align-items: center; justify-content: space-between; }
+  .sidehead button { text-transform: none; letter-spacing: 0; font-weight: 500; }
+  #vmlist { overflow-y: auto; flex: 1; padding: 4px 8px; }
+  .vm { padding: 8px 10px; border-radius: 6px; cursor: pointer; margin-bottom: 2px; border: 1px solid transparent; }
+  .vm:hover { background: var(--raised); }
+  .vm.active { background: var(--raised); border-color: var(--border); box-shadow: inset 2px 0 0 var(--accent-text); }
+  .vm .name { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .state { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex: none; }
+  .vm.running .state { background: var(--green); }
+  .vm .path { color: var(--dim); font-size: 11px; margin: 1px 0 0 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .vm .from { margin-left: auto; font-size: 10px; font-weight: 500; color: var(--dim); border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; }
   .sidefoot { padding: 10px; border-top: 1px solid var(--border); color: var(--dim); font-size: 11px; }
-  #main { grid-column: 2; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
-  .toolbar { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .toolbar h2 { margin: 0; font-size: 14px; flex: 1; min-width: 150px; }
-  button {
-    background: var(--panel2); color: var(--fg); border: 1px solid var(--border); border-radius: 6px;
-    padding: 6px 13px; font-size: 12px; cursor: pointer; font-family: inherit;
+  #shimline { margin-top: 8px; text-align: center; }
+
+  /* main: the views */
+  #main { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+  .tabs { display: flex; gap: 2px; padding: 0 14px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  .tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 11px 14px 9px; color: var(--dim); font-size: 13px; margin-bottom: -1px; }
+  .tabs button:hover:not(:disabled) { color: var(--fg); background: none; border-color: transparent; border-bottom-color: var(--border); }
+  .tabs button.active { color: var(--fg); font-weight: 600; border-bottom-color: var(--accent-text); }
+  .view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .toolbar { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .toolbar h2 { margin: 0; font-size: 15px; font-weight: 600; flex: 1; min-width: 150px; }
+
+  .field { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 11px; }
+  .field input { width: 70px; padding: 3px 7px; }
+
+  #log {
+    flex: 1; overflow-y: auto; padding: 10px 14px; background: var(--well); margin: 12px 16px 16px; border: 1px solid var(--border); border-radius: 8px;
+    font-family: "Cascadia Mono", "Cascadia Code", "Consolas", monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; min-height: 0;
   }
-  button:hover:not(:disabled) { border-color: var(--accent); }
-  button:disabled { opacity: .4; cursor: default; }
-  button.primary { background: var(--accent); color: #1a1b26; border-color: var(--accent); font-weight: 600; }
-  button.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
-  .field { display: flex; align-items: center; gap: 5px; color: var(--dim); font-size: 11px; }
-  .field input { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 5px; padding: 4px 7px; width: 64px; font-family: inherit; }
-  #log { flex: 1; overflow-y: auto; padding: 10px 14px; font-family: "Cascadia Code", "Consolas", monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; min-height: 0; }
+  #log .empty { font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; font-size: 13px; white-space: normal; }
   .ln { display: flex; gap: 8px; }
   .ln .t { color: var(--dim); flex: none; }
   .ln .g { flex: none; }
-  .white{color:#c0caf5}.gray{color:#9aa5ce}.red{color:var(--red)}.yellow{color:var(--yellow)}
-  .green{color:var(--green)}.darkgreen{color:#73a857}.cyan{color:var(--cyan)}.darkcyan{color:#4a9fc7}
-  .magenta{color:var(--magenta)}.blue{color:var(--accent)}.darkyellow{color:#c99a4e}
-  .empty { color: var(--dim); padding: 40px; text-align: center; }
+  .white { color: var(--fg); } .gray { color: var(--dim); } .red { color: var(--red); } .yellow { color: var(--yellow); }
+  .green { color: var(--green); } .darkgreen { color: color-mix(in srgb, var(--green) 70%, var(--dim)); }
+  .cyan { color: var(--cyan); } .darkcyan { color: color-mix(in srgb, var(--cyan) 70%, var(--dim)); }
+  .magenta { color: var(--magenta); } .blue { color: var(--blue); } .darkyellow { color: color-mix(in srgb, var(--yellow) 70%, var(--dim)); }
+
+  .empty { color: var(--dim); padding: 40px 24px; text-align: center; }
+  .empty .lead { font-size: 14px; font-weight: 600; color: var(--fg); margin-bottom: 4px; }
   .badge { font-size: 10px; padding: 1px 6px; border-radius: 4px; background: var(--border); color: var(--dim); }
+
+  /* trust badges */
+  .tb { display: inline-block; padding: 0 8px; border-radius: 999px; font-size: 11px; line-height: 18px; white-space: nowrap; border: 1px solid var(--border); }
+  .tb.good { color: var(--green); border-color: color-mix(in srgb, var(--green) 40%, transparent); background: color-mix(in srgb, var(--green) 10%, transparent); }
+  .tb.warn { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 40%, transparent); background: color-mix(in srgb, var(--yellow) 10%, transparent); }
+  .tb.bad  { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, transparent); background: color-mix(in srgb, var(--red) 10%, transparent); }
+  .tb.dim  { color: var(--dim); }
+
+  /* capsules view */
+  .scroll { overflow-y: auto; min-height: 0; }
+  .searchbar { padding: 10px 16px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; border-bottom: 1px solid var(--border); }
+  .searchbar input[type=text].q { flex: 1; min-width: 160px; }
+  .progress { padding: 2px 16px; color: var(--yellow); font-size: 11px; min-height: 20px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-weight: 600; font-size: 11px; color: var(--dim); padding: 6px 12px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg); }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr.row { cursor: pointer; }
+  tr.row:hover td { background: var(--panel); }
+  tr.row.sel td { background: var(--panel2); }
+  tr.row.sel td:first-child { box-shadow: inset 2px 0 0 var(--accent-text); }
+  tr.row:focus-visible { outline-offset: -2px; }
+  td.desc { color: var(--dim); max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .split { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+  #captable { max-height: 38%; flex: none; border-bottom: 1px solid var(--border); }
+  #capdetail { flex: 1; padding: 14px 16px; }
+  .dhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .dhead h3 { margin: 0; font-size: 16px; font-weight: 600; }
+  .dhead .actions { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+  .cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px 12px; min-width: 0; }
+  .card h4 { margin: 0 0 8px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); }
+  .summary { white-space: pre-wrap; word-break: break-word; font-family: "Cascadia Mono", "Cascadia Code", "Consolas", monospace; font-size: 12px; }
+  .check { display: flex; gap: 8px; margin: 3px 0; }
+  .check .mark { flex: none; font-weight: 600; width: 38px; }
+  .check .mark.ok { color: var(--green); } .check .mark.fail { color: var(--red); }
+  .sig { margin: 8px 0; padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); }
+  .verdict { margin-top: 10px; font-weight: 600; }
+  .note { color: var(--dim); font-size: 11px; }
+  .hit { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; gap: 12px; align-items: flex-start; }
+  .hit .body { flex: 1; min-width: 0; }
+  .hit .ref { font-weight: 600; word-break: break-all; }
+
+  /* the Box view: info line, sub-tabs, panes */
+  .boxinfo { padding: 8px 16px; border-bottom: 1px solid var(--border); display: flex; gap: 18px; flex-wrap: wrap; color: var(--dim); font-size: 12px; min-height: 36px; align-items: center; }
+  .boxinfo b { color: var(--fg); font-weight: 600; }
+  .subtabs { display: flex; gap: 2px; padding: 4px 16px 0; align-items: center; border-bottom: 1px solid var(--border); }
+  .subtabs > button[data-sub] { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 6px 12px 7px; color: var(--dim); margin-bottom: -1px; }
+  .subtabs > button[data-sub]:hover { color: var(--fg); border-bottom-color: var(--border); background: none; }
+  .subtabs > button[data-sub].active { color: var(--fg); font-weight: 600; border-bottom-color: var(--accent-text); }
+  .subtabs > button.small { margin: 0 0 3px 6px; }
+  .pane { flex: 1; min-height: 0; }
+  .pane .pad { max-width: none; }
+  .formline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  .formline input[type=text] { width: 260px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .seg button { border: none; border-radius: 0; background: none; padding: 3px 12px; color: var(--dim); }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button.on { background: var(--raised); color: var(--fg); font-weight: 600; }
+  .seg button.on.allow { color: var(--green); } .seg button.on.deny { color: var(--red); } .seg button.on.ask { color: var(--magenta); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.act { text-align: right; white-space: nowrap; }
+  td.act button + button { margin-left: 4px; }
+  .allow { color: var(--green); } .deny { color: var(--red); } .ask { color: var(--magenta); } .dimtext { color: var(--dim); }
+  .vm .meta { color: var(--dim); font-size: 11px; margin: 1px 0 0 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .vm .meta.net { font-variant-numeric: tabular-nums; }
+  .vm .meta .warn { color: var(--yellow); } .vm .meta .bad { color: var(--red); }
+  .vm.running .state { box-shadow: 0 0 0 2px color-mix(in srgb, var(--green) 25%, transparent); }
+  .vm.elsewhere .state { background: var(--yellow); }
+
+  /* trust view */
+  .pad { padding: 16px 18px; max-width: 880px; }
+  .pad h3 { margin: 22px 0 8px; font-size: 14px; font-weight: 600; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  .pad h3:first-child { margin-top: 0; }
+  label.check-row { display: flex; gap: 9px; align-items: flex-start; }
+  .keyline { display: flex; gap: 8px; align-items: center; }
+  .keyline .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
+
+  /* dialogs and toasts */
+  #modal-root { position: fixed; inset: 0; pointer-events: none; }
+  .scrim { position: fixed; inset: 0; background: var(--scrim); display: flex; align-items: flex-start; justify-content: center; padding-top: 8vh; pointer-events: auto; overflow-y: auto; }
+  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; width: min(560px, 92vw); box-shadow: 0 16px 40px rgba(1, 4, 9, .5); margin-bottom: 8vh; overflow: hidden; }
+  .modal header { padding: 12px 16px; font-size: 14px; font-weight: 600; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; }
+  .modal header span { flex: 1; }
+  .modal .mbody { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+  .modal footer { padding: 10px 16px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; align-items: center; background: var(--panel2); }
+  .modal footer .mprogress { margin-right: auto; color: var(--yellow); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
+  .formrow { display: flex; flex-direction: column; gap: 4px; }
+  .formrow > label { color: var(--dim); font-size: 11px; }
+  .formrow input[type=text], .formrow select { width: 100%; }
+  .asks { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+  .asks .line { display: flex; gap: 8px; }
+  .asks .k { color: var(--dim); width: 70px; flex: none; }
+  .err { color: var(--red); white-space: pre-wrap; word-break: break-word; }
+  #toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 6px; max-width: 420px; pointer-events: none; }
+  .toast { background: var(--raised); border: 1px solid var(--border); border-left: 3px solid var(--dim); border-radius: 6px; padding: 8px 12px; pointer-events: auto; word-break: break-word; }
+  .toast.ok { border-left-color: var(--green); } .toast.error { border-left-color: var(--red); }
+
+  /* a narrow window: a slimmer sidebar, and the Capsule list keeps only what decides things */
+  @media (max-width: 860px) {
+    body { grid-template-columns: 200px 1fr; }
+    #captable th:nth-child(3), #captable td:nth-child(3), #captable th:nth-child(4), #captable td:nth-child(4) { display: none; }
+    #captable td.desc { max-width: 160px; }
+    .searchbar input[type=text]#creg { width: 100%; }
+  }
 </style>
 </head>
 <body>
   <div id="sidebar">
-    <div class="brand"><span class="dot"></span> elpis</div>
+    <div class="brand">
+      <img class="logo" src="logo.png" alt="" />
+      <b>Elpis</b>
+      <button id="helpbtn" class="help-q" title="Help (F1)" aria-label="Help">?</button>
+      <button id="theme" title="Theme" aria-label="Theme">◐</button>
+    </div>
+    <div class="sidehead"><span>Boxes</span><button id="newbox" class="small" title="Make a box from an agent kit, a template or another box">+ New</button></div>
     <div id="vmlist"></div>
     <div class="sidefoot">
       <div><button id="refresh" style="width:100%">Rescan work folders</button></div>
-      <div id="shimline" style="margin-top:8px"></div>
+      <div id="shimline"></div>
     </div>
   </div>
+
   <div id="main">
-    <div class="toolbar">
-      <h2 id="title">Select a VM</h2>
-      <label class="field" title="Windows 127.0.0.1 port the container can reach (e.g. Ollama 11434)">
-        host&#8209;port <input id="hostport" value="11434" />
-      </label>
-      <button id="start" class="primary" disabled>Start</button>
-      <button id="stop" class="danger" disabled>Stop</button>
-      <button id="term" disabled>Terminal&#8230;</button>
-      <button id="opencode" disabled title="Open OpenCode in a terminal (needs host-port to reach a model)">OpenCode&#8230;</button>
-      <button id="clear" title="Clear the log view">Clear</button>
-    </div>
-    <div id="log"><div class="empty">Pick a VM on the left, then Start.</div></div>
+    <nav class="tabs" role="tablist" aria-label="Views">
+      <button role="tab" data-view="box" class="active">Box</button>
+      <button role="tab" data-view="agents">Agents</button>
+      <button role="tab" data-view="capsules">Capsules</button>
+      <button role="tab" data-view="templates">Templates</button>
+      <button role="tab" data-view="trust">Trust &amp; keys</button>
+    </nav>
+
+    <section id="view-box" class="view">
+      <div class="toolbar">
+        <h2 id="title">Select a box</h2>
+        <label class="field" title="Windows 127.0.0.1 port the container can reach (e.g. Ollama 11434)">
+          host&#8209;port <input type="text" id="hostport" value="11434" />
+        </label>
+        <button id="start" class="primary" disabled>Start</button>
+        <button id="stop" class="danger" disabled>Stop</button>
+        <button id="term" disabled>Terminal&#8230;</button>
+        <button id="agent" disabled title="Open the box's agent (a kit's or Capsule's entrypoint) in a terminal">Agent&#8230;</button>
+        <button id="clear" title="Clear the log view">Clear</button>
+        <button id="helpbox" class="help-q" title="Help with boxes" aria-label="Help with boxes">?</button>
+      </div>
+      <div id="boxinfo" class="boxinfo"></div>
+      <div class="subtabs" role="tablist" aria-label="About this box" id="subtabs">
+        <button role="tab" data-sub="log" class="active">Logs</button>
+        <button role="tab" data-sub="net">Network activity</button>
+        <button role="tab" data-sub="rules">Network rules</button>
+        <button role="tab" data-sub="ports">Ports</button>
+        <button role="tab" data-sub="files">Files</button>
+        <span style="flex:1"></span>
+        <button id="autostop" class="small" title="">Auto-stop</button>
+        <button id="copybox" class="small" title="A new box with this one's image and settings, and an empty disk">Copy&#8230;</button>
+        <button id="savetpl" class="small" title="Save this stopped box as a template">Save as template&#8230;</button>
+        <button id="delbox" class="small danger" title="Delete this stopped box and its disk">Delete&#8230;</button>
+      </div>
+      <div id="log"></div>
+      <div id="pane" class="pane scroll" hidden></div>
+    </section>
+
+    <section id="view-agents" class="view" hidden>
+      <div class="searchbar">
+        <input type="text" class="q" id="kq" placeholder="Filter agents and kits" aria-label="Filter" />
+        <span class="note" id="kinfo"></span>
+        <span style="flex:1"></span>
+        <button id="krefresh" title="Fetch the kit list from Docker Hub again">Refresh</button>
+        <button id="helpkits" class="help-q" title="Help with agents" aria-label="Help with agents">?</button>
+      </div>
+      <div class="progress" id="kprogress"></div>
+      <div id="kittable" class="scroll" style="flex:1"></div>
+    </section>
+
+    <section id="view-templates" class="view" hidden>
+      <div class="searchbar">
+        <span class="note">A template is a stopped box frozen with everything installed in it; new boxes start from it with their own empty disk.</span>
+        <span style="flex:1"></span>
+        <button id="tplsave" title="Save the selected (stopped) box as a template">Save selected box&#8230;</button>
+        <button id="helptpl" class="help-q" title="Help with templates" aria-label="Help with templates">?</button>
+      </div>
+      <div id="tpltable" class="scroll" style="flex:1"></div>
+    </section>
+
+    <section id="view-capsules" class="view" hidden>
+      <div class="searchbar">
+        <input type="text" class="q" id="cq" placeholder="Search Capsules by name or description" aria-label="Search" />
+        <select id="cscope" aria-label="Where to search">
+          <option value="store">My Capsules</option>
+          <option value="registry">A registry</option>
+        </select>
+        <input type="text" id="creg" placeholder="registry.example.com/team" aria-label="Registry" hidden style="width:220px" />
+        <button id="csearch">Search</button>
+        <span style="flex:1"></span>
+        <button id="cbuild" title="Build a Capsule folder (with capsule.yaml) into your store">Build&#8230;</button>
+        <button id="cpull" title="Download a Capsule from a registry">Pull&#8230;</button>
+        <button id="crefresh" title="Re-read the store and re-check every Capsule">Refresh</button>
+        <button id="helpcaps" class="help-q" title="Help with Capsules" aria-label="Help with Capsules">?</button>
+      </div>
+      <div class="progress" id="cprogress"></div>
+      <div class="split">
+        <div id="captable" class="scroll"></div>
+        <div id="capdetail" class="scroll"></div>
+      </div>
+    </section>
+
+    <section id="view-trust" class="view scroll" hidden>
+      <div class="pad" id="trustview"></div>
+    </section>
   </div>
-<script>
-const { invoke } = window.__TAURI__.core;
-const { listen } = window.__TAURI__.event;
-const $ = (id) => document.getElementById(id);
-let current = null;            // selected VM id
-const vms = new Map();         // id -> {id, work, namespace, path, running}
-const logs = new Map();        // id -> array of line nodes (kept per VM)
 
-function esc(s){ const d=document.createElement('span'); d.textContent=s; return d.innerHTML; }
-
-function renderList() {
-  const el = $('vmlist'); el.innerHTML = '';
-  for (const vm of vms.values()) {
-    const d = document.createElement('div');
-    d.className = 'vm' + (vm.running ? ' running' : '') + (vm.id === current ? ' active' : '');
-    d.innerHTML = `<div class="name"><span class="state"></span>${esc(vm.id)}</div><div class="path">${esc(vm.path)}</div>`;
-    d.onclick = () => select(vm.id);
-    el.appendChild(d);
-  }
-  if (!vms.size) el.innerHTML = '<div class="empty">No boxes found yet.<br>Create one with <code>elpis-run run AGENT</code> or <code>elpis-run create</code>.</div>';
-}
-
-function select(id) {
-  current = id;
-  const vm = vms.get(id);
-  $('title').textContent = vm ? vm.id : 'Select a VM';
-  const log = $('log'); log.innerHTML = '';
-  for (const node of (logs.get(id) || [])) log.appendChild(node);
-  if (!logs.get(id)?.length) log.innerHTML = '<div class="empty">Not started yet.</div>';
-  log.scrollTop = log.scrollHeight;
-  renderList(); updateButtons();
-}
-
-function updateButtons() {
-  const vm = vms.get(current);
-  $('start').disabled = !vm || vm.running;
-  $('stop').disabled = !vm || !vm.running;
-  $('term').disabled = !vm || !vm.running;
-  $('opencode').disabled = !vm || !vm.running;
-}
-
-function addLine(id, line) {
-  if (!logs.has(id)) logs.set(id, []);
-  const arr = logs.get(id);
-  const node = document.createElement('div');
-  node.className = 'ln';
-  node.innerHTML = `<span class="t">${esc(line.time)}</span><span class="g ${line.color}">[${esc(line.tag)}]</span><span class="${line.color}">${esc(line.text)}</span>`;
-  arr.push(node);
-  if (arr.length > 2000) arr.shift();
-  if (id === current) {
-    const log = $('log');
-    if (log.querySelector('.empty')) log.innerHTML = '';
-    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
-    log.appendChild(node);
-    if (atBottom) log.scrollTop = log.scrollHeight;
-  }
-}
-
-async function refresh() {
-  const list = await invoke('list_vms');
-  vms.clear();
-  for (const vm of list) vms.set(vm.id, vm);
-  if (current && !vms.has(current)) current = null;
-  if (!current && list.length) current = list[0].id;
-  select(current);
-  const v = await invoke('shim_info');
-  $('shimline').textContent = v;
-}
-
-$('refresh').onclick = refresh;
-$('clear').onclick = () => { if (current) { logs.set(current, []); select(current); } };
-
-$('start').onclick = async () => {
-  const vm = vms.get(current); if (!vm) return;
-  const hp = $('hostport').value.trim();
-  const ports = hp ? hp.split(',').map(s => parseInt(s.trim())).filter(Number.isInteger) : [];
-  $('start').disabled = true;
-  try { await invoke('start_vm', { id: vm.id, ports }); }
-  catch (e) { addLine(vm.id, { time: '', tag: 'gui', color: 'red', text: 'start failed: ' + e }); }
-};
-$('stop').onclick = async () => { const vm = vms.get(current); if (vm) { $('stop').disabled = true; await invoke('stop_vm', { id: vm.id }); } };
-$('term').onclick = () => current && invoke('open_terminal', { id: current, command: 'bash' });
-$('opencode').onclick = () => current && invoke('open_terminal', { id: current, command: 'cd /e/Project && opencode' });
-
-listen('log', (e) => addLine(e.payload.id, e.payload));
-listen('vm-state', (e) => { const vm = vms.get(e.payload.id); if (vm) { vm.running = e.payload.running; renderList(); updateButtons(); } });
-
-refresh();
-</script>
+  <div id="modal-root"></div>
+  <div id="toasts" aria-live="polite"></div>
+  <script src="app.js"></script>
+  <script src="boxes.js"></script>
 </body>
 </html>
