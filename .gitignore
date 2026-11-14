@@ -2,3 +2,4 @@
 /third_party/libkrun
 /guest/out
 /crates/elpis-gui/gen
+/.claude/settings.local.json
