@@ -28,6 +28,27 @@ function h(tag, props, ...kids) {
 
 function clear(el) { el.replaceChildren(); return el; }
 
+/** An empty state: the logo, a lead line, then whatever explains it. */
+const emptyState = (lead, ...rest) => h('div', { class: 'empty' }, h('img', { class: 'ghost', src: 'logo.png', alt: '' }), lead && h('div', { class: 'lead', text: lead }), ...rest);
+
+// ---------------------------------------------------------------- theme: follow the system, or pin dark or light
+
+const THEMES = ['auto', 'dark', 'light'];
+let theme = 'auto';
+try { theme = localStorage.getItem('elpis.theme') || 'auto'; } catch {}
+function applyTheme(t) {
+  if (t === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+  const b = $('theme');
+  b.textContent = { auto: '◐', dark: '☾', light: '☀' }[t];
+  b.title = 'Theme: ' + (t === 'auto' ? 'follows your system' : t) + ' (click to change)';
+}
+applyTheme(theme);
+$('theme').onclick = () => {
+  theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+  try { localStorage.setItem('elpis.theme', theme); } catch {}
+  applyTheme(theme);
+};
+
 // ---------------------------------------------------------------- toasts and dialogs
 
 function toast(text, kind = 'info') {
@@ -121,17 +142,17 @@ function renderList() {
       h('div', { class: 'path', text: vm.path })));
   }
   if (!vms.size) {
-    el.append(h('div', { class: 'empty' }, 'No boxes found yet.', h('br'), 'Run a Capsule from the Capsules tab, or create one with ', h('code', { text: 'elpis-run create' }), '.'));
+    el.append(emptyState('No boxes yet', h('div', null, 'Run a Capsule from the Capsules tab, or create one with ', h('code', { text: 'elpis-run create' }), '.')));
   }
 }
 
 function select(id) {
   current = id;
   const vm = vms.get(id);
-  $('title').textContent = vm ? vm.id : 'Select a VM';
+  $('title').textContent = vm ? vm.id : 'Select a box';
   const log = clear($('log'));
   for (const node of (logs.get(id) || [])) log.append(node);
-  if (!logs.get(id)?.length) log.append(h('div', { class: 'empty', text: vm ? 'Not started yet.' : 'Pick a VM on the left, then Start.' }));
+  if (!logs.get(id)?.length) log.append(emptyState(vm ? 'Not started yet' : 'Pick a box', h('div', { text: vm ? 'Press Start to boot it; its log appears here.' : 'Choose one on the left, then Start.' })));
   log.scrollTop = log.scrollHeight;
   renderList(); updateButtons();
 }
@@ -231,14 +252,13 @@ function renderCapTable() {
   const el = clear($('captable'));
   const shown = caps.filter(matches);
   if (!caps.length) {
-    el.append(h('div', { class: 'empty' },
-      h('div', { text: 'No Capsules yet.' }),
+    el.append(emptyState('No Capsules yet',
       h('div', { class: 'note', text: 'A Capsule is a portable agent: its image, files and start command, and what it asks for. Build one from a folder, or pull one from a registry.' }),
       h('div', { style: 'margin-top:12px;display:flex;gap:8px;justify-content:center' },
         h('button', { text: 'Build…', onclick: buildDialog }), h('button', { text: 'Pull…', onclick: pullDialog }))));
     return;
   }
-  if (!shown.length) { el.append(h('div', { class: 'empty', text: `No Capsule in your store matches “${filterText}”.` })); return; }
+  if (!shown.length) { el.append(emptyState('Nothing matches', h('div', { text: `No Capsule in your store matches “${filterText}”.` }))); return; }
   const rows = shown.map((c) => h('tr', {
     class: 'row' + (c.reference === selectedRef ? ' sel' : ''), tabindex: '0', dataset: { ref: c.reference },
     onclick: () => selectCapsule(c.reference),
@@ -288,7 +308,7 @@ async function renderDetail() {
   const el = clear($('capdetail'));
   if (searchHits) return renderResults(el);
   const c = caps.find((x) => x.reference === selectedRef);
-  if (!c) { el.append(h('div', { class: 'empty', text: 'Select a Capsule to see what it asks for and who vouches for it.' })); return; }
+  if (!c) { el.append(emptyState('Pick a Capsule', h('div', { text: 'Select one to see what it asks for and who vouches for it.' }))); return; }
   el.append(h('div', { class: 'note', text: 'checking…' }));
   const seq = ++renderDetail.seq || (renderDetail.seq = 1);
   let d;

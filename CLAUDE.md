@@ -34,6 +34,7 @@ cargo clippy --release --locked
 | `crates/elpis-shim/src` | containerd shim v2 with libkrun linked in: `setup.rs` (bundle → devices), `vm.rs`, `streams.rs`, `gpt.rs`, `mkfs.rs` (tools VM) |
 | `guest/` | Dockerfile for kernel + erofs rootfs (vminitd, crun, `elpis-mkfs`); `vminitd/clock` plugin |
 | `patches/libkrun/` | Numbered patches on the pinned libkrun commit |
+| `assets/`, `scripts/make-icons.py` | The icon master (`assets/elpis-icon.png`) and the script that regenerates the GUI's icons and logo from it (needs Pillow) |
 | `docs/` | User and reference docs; keep them in step with code |
 
 ## Rules

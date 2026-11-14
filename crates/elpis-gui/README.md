@@ -13,6 +13,10 @@ A desktop GUI for the [elpis](../elpis) engine — start elpis VMs, watch their 
 - **Trust & keys** (another tab): your signing policy and keys, see below.
 - **System tray** with Show and Quit.
 
+## Look and feel
+
+The identity comes from the icon (an amphora in a hexagon, cut from olive paper): olive surfaces, sand text and highlights, and one terracotta accent for the action that matters, with hexagons for status marks and headings. There is a dark theme and a light "sand paper" one; the page follows your system's setting, and the ◐ button beside the name pins dark or light (remembered). All colours are variables at the top of `ui/index.html`. The icon master is `assets/elpis-icon.png`; `python scripts/make-icons.py` (needs Pillow) regenerates every size, `crates/elpis-gui/icons/*` and `ui/logo.png`. The TUI uses the same colours.
+
 ## Capsules
 
 A [Capsule](../../docs/capsule-manifest.md) is a portable agent. The **Capsules** tab lists the ones in your store with a trust badge (`✓ alice`, `signed, untrusted`, `unsigned`, `✗ modified`) and, for the selected one, what it runs and asks for plus its full verification: files against the build, the payload archive, provenance and each signature against your trust policy.

@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/elpis-icon.png" alt="Elpis: an amphora inside a hexagon" width="128" height="128"></p>
+
 # Elpis
 
 Run coding agents in microVM sandboxes on Windows. Each agent gets its own lightweight VM (libkrun on Windows Hypervisor Platform) and runs as a container inside it. The box has its own network with an egress policy, shared workspace folders, Docker inside if it wants it, and API keys that never enter it. Boxes can be saved as templates, and everything is managed from a CLI, a terminal dashboard or a desktop GUI. A Rust workspace:
