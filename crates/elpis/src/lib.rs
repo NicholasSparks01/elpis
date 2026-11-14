@@ -1,4 +1,4 @@
-//! elpis: drive the Docker Sandboxes elpis shim directly, with no sbx daemon and no containerd.
+//! elpis: the engine that drives a containerd shim to run coding-agent boxes in microVMs, with no daemon and no containerd.
 //!
 //! [`session::Session`] plays containerd's part, the same way sbx's built-in containerd does:
 //!   1. serves the ttrpc event socket the shim publishes to (TTRPC_ADDRESS) and logs every event

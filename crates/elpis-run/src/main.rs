@@ -1,4 +1,4 @@
-//! elpis-run: start a container on the Docker Sandboxes elpis shim with no sbx daemon and no containerd,
+//! elpis-run: run coding agents in microVM sandboxes on Windows, with no daemon and no containerd,
 //! or attach to one that's already running (for example, one started by elpis-gui).
 //!
 //! `elpis-run run opencode` works like `sbx run opencode`: it fetches the agent's kit from Docker Hub
@@ -15,7 +15,7 @@ use elpis::{Color, Config, Log, Session, ShimLog, console};
 use std::path::{Path, PathBuf};
 use tokio::sync::watch;
 
-/// Start a container on the Docker Sandboxes elpis shim with no sbx daemon and no containerd.
+/// Run coding agents in microVM sandboxes on Windows, with no daemon and no containerd.
 #[derive(Parser)]
 #[command(version, args_conflicts_with_subcommands = true)]
 struct Cli {
@@ -267,7 +267,7 @@ struct RunArgs {
     /// Let the container reach Windows 127.0.0.1:PORT through /run/host-sockets/tcp-PORT.sock (repeatable)
     #[arg(long = "host-port", value_name = "PORT")]
     host_ports: Vec<u16>,
-    /// Attach a virtio-net NIC and log the guest's frames (stage 1 of general networking)
+    /// Attach a virtio-net NIC through the elpis network stack (internet, DNS, policy, credential proxy)
     #[arg(long)]
     net: bool,
 }

@@ -19,7 +19,7 @@ The engine plays containerd's part to the shim:
 4. speaks **ttrpc** to `containerd.task.v3.Task`: `Create`, `Start`, `Connect`, `Exec`, `Wait`, `ResizePty`
 5. on stop: `Kill`, `Delete`, `Shutdown`
 
-The VMM's job is described in [docs/vmm.md](docs/vmm.md). API keys stay on the host: a [credential proxy](#api-keys-the-credential-proxy) adds them to the box's requests.
+**Documentation:** [getting started](docs/getting-started.md), [usage](docs/usage.md), [networking](docs/networking.md), [credentials](docs/credentials.md), [configuration](docs/configuration.md), [architecture](docs/architecture.md), [security model](docs/security.md), [troubleshooting](docs/troubleshooting.md); all in [docs/](docs/README.md). The VMM's job is described in [docs/vmm.md](docs/vmm.md). API keys stay on the host: a [credential proxy](#api-keys-the-credential-proxy) adds them to the box's requests.
 
 ## Independence from Docker, and what stays optional
 

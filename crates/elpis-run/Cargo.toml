@@ -1,6 +1,6 @@
 [package]
 name = "elpis-run"
-description = "Start a container on the Docker Sandboxes elpis shim with no sbx daemon and no containerd"
+description = "Run coding agents in microVM sandboxes on Windows, with no daemon and no containerd"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

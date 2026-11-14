@@ -38,7 +38,7 @@ pub struct Config {
     pub stdio: bool,
     /// Windows 127.0.0.1 ports the container can reach through /run/host-sockets/tcp-PORT.sock
     pub host_ports: Vec<u16>,
-    /// Attach a virtio-net NIC and run the host datapath probe (stage 1 of general networking)
+    /// Attach a virtio-net NIC through the elpis network stack (internet, DNS, policy, credential proxy)
     pub network: bool,
 }
 

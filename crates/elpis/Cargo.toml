@@ -1,6 +1,6 @@
 [package]
 name = "elpis"
-description = "Drive the Docker Sandboxes elpis shim directly: the engine behind elpis-run and elpis-gui"
+description = "The Elpis engine: run coding-agent boxes in microVMs on Windows, behind elpis-run, elpis-tui and elpis-gui"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
