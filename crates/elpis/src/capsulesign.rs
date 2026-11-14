@@ -317,7 +317,42 @@ pub struct Report {
     pub provenance: Option<Provenance>,
 }
 
+impl Trust {
+    /// Whether a Capsule may be run under this policy. Fails when its files no longer match the build, or when
+    /// the policy requires a signature from a trusted key, there is none, and `allow_unsigned` isn't set.
+    pub fn admit(&self, report: &Report, allow_unsigned: bool) -> Result<()> {
+        if !report.intact() {
+            bail!("{0} failed its integrity check; run `elpis-run capsule verify {0}` for details", report.reference);
+        }
+        if self.require_signed && !report.is_trusted() && !allow_unsigned {
+            bail!(
+                "{} is not signed by a key you trust ({}), and your policy requires that. Trust its signer (`elpis-run capsule trust add`), turn the requirement off (`elpis-run capsule trust require off`), or run it with `elpis-run capsule run … --allow-unsigned`",
+                report.reference,
+                report.verdict()
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Report {
+    /// One line on who vouches for the Capsule, in terms of the consumer's trust policy.
+    pub fn verdict(&self) -> String {
+        if !self.intact() {
+            return "INTEGRITY CHECK FAILED: the stored files no longer match the build (see `capsule verify`)".to_owned();
+        }
+        let signers = self.trusted_signers();
+        if !signers.is_empty() {
+            return format!("signed by {} (trusted)", signers.join(", "));
+        }
+        let valid = self.signatures.iter().filter(|s| !matches!(s.standing, Standing::Invalid(_))).count();
+        match (self.signatures.len(), valid) {
+            (0, _) => "unsigned: nobody vouches for it".to_owned(),
+            (_, 0) => "has signatures, but none is valid for this Capsule".to_owned(),
+            _ => "signed, but not by a key you trust (`capsule verify` shows who)".to_owned(),
+        }
+    }
+
     /// The stored files match what was built and pass the payload checks.
     pub fn intact(&self) -> bool {
         self.checks.iter().all(|c| c.result.is_ok())
@@ -529,6 +564,36 @@ mod tests {
         assert_eq!(report.signatures.iter().filter(|s| s.standing == Standing::Unknown).count(), 1, "mallory is valid but not trusted");
         assert_eq!(report.trusted_signers(), ["alice"]);
         assert!(report.is_trusted());
+    }
+
+    #[test]
+    fn the_policy_admits_or_refuses_by_the_report() {
+        let (store, built) = built_capsule("admit", "1.0.0", "myteam");
+        let (key, public) = signer();
+        let lax = Trust::default();
+        let strict = Trust { require_signed: true, ..Default::default() };
+
+        let unsigned = verify(&store, &built, &lax);
+        assert_eq!(unsigned.verdict(), "unsigned: nobody vouches for it");
+        assert!(lax.admit(&unsigned, false).is_ok(), "no requirement: unsigned is allowed (and reported)");
+        let e = strict.admit(&unsigned, false).unwrap_err().to_string();
+        assert!(e.contains("requires that") && e.contains("--allow-unsigned"), "{e}");
+        assert!(strict.admit(&unsigned, true).is_ok(), "the explicit override");
+
+        store.add_signature(&built, &sign(&key, &built).unwrap()).unwrap();
+        assert_eq!(verify(&store, &built, &lax).verdict(), "signed, but not by a key you trust (`capsule verify` shows who)");
+        assert!(strict.admit(&verify(&store, &built, &strict), false).is_err(), "valid but unknown key");
+        let mut trusting = Trust { require_signed: true, ..Default::default() };
+        trusting.add("alice", &public, &["myteam".into()]).unwrap();
+        let trusted = verify(&store, &built, &trusting);
+        assert_eq!(trusted.verdict(), "signed by alice (trusted)");
+        assert!(trusting.admit(&trusted, false).is_ok());
+
+        // a modified Capsule is refused whatever the policy, even with the override
+        std::fs::write(built.payload_path().unwrap(), b"swapped").unwrap();
+        let broken = verify(&store, &built, &trusting);
+        assert!(broken.verdict().starts_with("INTEGRITY CHECK FAILED"));
+        assert!(lax.admit(&broken, true).unwrap_err().to_string().contains("integrity check"));
     }
 
     #[test]

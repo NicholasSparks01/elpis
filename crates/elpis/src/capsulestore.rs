@@ -107,11 +107,16 @@ impl Built {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
 }
 
 impl Store {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// The store in the Elpis data folder.
     pub fn open() -> Store {
         Store { root: debug_root().join("capsules") }

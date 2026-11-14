@@ -487,7 +487,8 @@ impl Capsule {
     pub fn summary(&self, digest: Option<&str>) -> String {
         let (rt, spec) = (&self.spec.runtime, &self.spec);
         let mut s = format!("{}\n", self.reference());
-        let mut line = |label: &str, text: String| s.push_str(&format!("  {label:<12}{text}\n"));
+        // every value here comes from a manifest someone else wrote, so none reaches a terminal unchecked
+        let mut line = |label: &str, text: String| s.push_str(&format!("  {label:<12}{}\n", display_safe(&text)));
         if !self.metadata.description.is_empty() {
             line("about", display_safe(&self.metadata.description));
         }
@@ -546,7 +547,7 @@ impl Capsule {
 
         let req = &spec.requests;
         s.push_str("  asks for (you decide what is granted):\n");
-        let mut ask = |label: &str, text: String| s.push_str(&format!("    {label:<11}{text}\n"));
+        let mut ask = |label: &str, text: String| s.push_str(&format!("    {label:<11}{}\n", display_safe(&text)));
         ask("network", if req.network.allow.is_empty() { "none".to_owned() } else { req.network.allow.join(", ") });
         for c in &req.credentials {
             let hosts: Vec<&str> = c.inject.iter().map(|i| i.domain.as_str()).collect();
@@ -1020,7 +1021,7 @@ spec:
     fn converts_to_a_boxfile() {
         let c = Capsule::parse(&manifest()).unwrap();
         let port = PortMap::parse("8080:3000").unwrap();
-        let b = c.to_boxfile(&[port.clone()]).unwrap();
+        let b = c.to_boxfile(std::slice::from_ref(&port)).unwrap();
         assert_eq!(b.source, "capsule myteam/code-reviewer@1.2.0");
         assert_eq!(b.image.as_deref(), Some(DIGEST));
         assert_eq!(b.workspace.as_deref(), Some("/work"));
@@ -1126,6 +1127,17 @@ spec:
         assert!(forked_manifest(&manifest(), "a/b", "1.0", "a/b@1.0.0", &digest).is_err());
         assert!(forked_manifest("spec: {}", "a/b", "1.0.0", "a/b@1.0.0", &digest).is_err());
         assert!(forked_manifest(&manifest(), "a/b", "1.0.0", "not a reference", &digest).is_err(), "a malformed parent is caught by validation");
+    }
+
+    #[test]
+    fn a_summary_never_carries_escape_sequences_from_the_manifest() {
+        // an entrypoint and an image tag with ESC bytes (YAML "\e" escapes inside double quotes)
+        let evil = manifest().replace("entrypoint: [\"node\", \"/opt/agent/main.js\"]", "entrypoint: [\"node\", \"/opt/\\e[2Jx\"]");
+        let capsule = Capsule::parse(&evil).unwrap();
+        assert!(capsule.spec.runtime.entrypoint[1].contains('\u{1b}'), "the manifest really holds an ESC");
+        let text = capsule.summary(None);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("/opt/?[2Jx"));
     }
 
     #[test]

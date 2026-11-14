@@ -3,12 +3,17 @@
 //! Left: a scrollable list of boxes (one per work folder under `%USERPROFILE%\elpis`), each a card
 //! with status, uptime, CPU and RAM, size and network counts, plus "+ New box". Right: the selected
 //! box's info and tabs: network activity (allow/block per host), network rules (the egress policy),
-//! filesystem (shared folders, read/write), logs and published ports; plus two global tabs: the sbx agent kits on Docker Hub
-//! (make a box from one, like `sbx run`) and saved templates. VMs run in-process through the elpis engine.
+//! filesystem (shared folders, read/write), logs and published ports; plus three global tabs: the sbx agent kits on Docker Hub
+//! (make a box from one, like `sbx run`), Capsules (portable agents: who vouches for each, what it asks for, run it
+//! after granting) and saved templates. VMs run in-process through the elpis engine.
 
 use anyhow::Result;
 use elpis::kits::KitSummary;
 use elpis::boxfile::{BoxFile, PortMap};
+use elpis::capsule::{Capsule, Grants, display_safe};
+use elpis::capsulerun::{self, Prepared};
+use elpis::capsulesign::{Report, Standing};
+use elpis::capsulestore::{Built, Store as CapsuleStore};
 use elpis::events::Activity;
 use elpis::netstack::{HostStat, NetProbe, NetStats};
 use elpis::policy::{Action, Policy};
@@ -24,7 +29,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::os::windows::process::CommandExt;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -99,16 +104,18 @@ enum Tab {
     Logs,
     Ports,
     Kits,
+    Capsules,
     Templates,
 }
 
-const TABS: [(Tab, &str); 7] = [
+const TABS: [(Tab, &str); 8] = [
     (Tab::Activity, "Network activity"),
     (Tab::Rules, "Network rules"),
     (Tab::Files, "Files"),
     (Tab::Ports, "Ports"),
     (Tab::Logs, "Logs"),
     (Tab::Kits, "Agents"),
+    (Tab::Capsules, "Capsules"),
     (Tab::Templates, "Templates"),
 ];
 
@@ -141,6 +148,21 @@ impl NewSource {
     }
 }
 
+/// The "run this Capsule" popup: what it asks for (shown, then granted on Enter) and the box to make.
+struct RunCapsule {
+    prepared: Prepared,
+    name: String,
+    workspace: String,
+    field: usize,
+    grants: Grants,
+}
+
+impl RunCapsule {
+    fn has_workspace(&self) -> bool {
+        self.prepared.capsule.spec.interfaces.workspace.is_some()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Focus {
     Boxes,
@@ -157,6 +179,10 @@ enum Mode {
     ChooseAction(String),
     SaveTemplate(String),
     ConfirmDelete(String),
+    /// A built Capsule is ready to run: shows its requests and standing, makes a box on Enter
+    RunCapsule(Box<RunCapsule>),
+    /// Remove a built Capsule (NAME@VERSION) from the store
+    ConfirmRemoveCapsule(String),
     /// A running box wants to reach a host no rule covers (policy default "ask")
     Approve { box_name: String, host: String, ports: String, attempts: u64 },
 }
@@ -166,6 +192,10 @@ enum AppEvent {
     Progress(String),
     Done(Result<String, String>),
     Catalog(Result<Vec<KitSummary>, String>),
+    /// Verification of the built Capsules finished: (digest, report) for each
+    Verified(Result<Vec<(String, Report)>, String>),
+    /// A Capsule was loaded, verified against the trust policy and admitted (or refused)
+    CapsuleReady(Result<Box<Prepared>, String>),
 }
 
 /// Where things were drawn last frame, for mouse clicks.
@@ -203,6 +233,14 @@ struct App {
     templates: Vec<Template>,
     /// References of pulled images
     pulled: Vec<String>,
+    capsule_store: CapsuleStore,
+    capsules: Vec<Built>,
+    /// How each built Capsule verified, by its digest (absent until the check has run)
+    capsule_reports: HashMap<String, Report>,
+    verifying: bool,
+    /// Scroll of the Capsule detail pane, and the Capsule it belongs to
+    detail_scroll: u16,
+    detail_for: String,
 }
 
 fn contains(r: Rect, x: u16, y: u16) -> bool {
@@ -288,6 +326,12 @@ impl App {
             catalog_loading: false,
             templates: Vec::new(),
             pulled: Vec::new(),
+            capsule_store: CapsuleStore::open(),
+            capsules: Vec::new(),
+            capsule_reports: HashMap::new(),
+            verifying: false,
+            detail_scroll: 0,
+            detail_for: String::new(),
         };
         app.refresh_boxes(None);
         app.refresh_store();
@@ -297,6 +341,96 @@ impl App {
     fn refresh_store(&mut self) {
         self.templates = workdir::templates();
         self.pulled = elpis::registry::list().into_iter().map(|i| i.reference).collect();
+        self.capsules = self.capsule_store.list();
+    }
+
+    /// The selected Capsule on the Capsules tab.
+    fn current_capsule(&self) -> Option<&Built> {
+        if self.tab != Tab::Capsules {
+            return None;
+        }
+        self.table.selected().and_then(|i| self.capsules.get(i))
+    }
+
+    /// Check every built Capsule (its files against the build, its payload, its signatures against the trust
+    /// policy) in the background: hashing a payload shouldn't hold up the screen.
+    fn verify_capsules(&mut self) {
+        if self.verifying {
+            return;
+        }
+        self.verifying = true;
+        let (store, tx) = (self.capsule_store.clone(), self.events_tx.clone());
+        self.handle.spawn_blocking(move || {
+            let result = elpis::capsulesign::Trust::load()
+                .map(|trust| store.list().into_iter().map(|b| (b.digest.clone(), elpis::capsulesign::verify(&store, &b, &trust))).collect())
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::Verified(result));
+        });
+    }
+
+    /// Start checking if any built Capsule has no result yet.
+    fn ensure_verified(&mut self) {
+        if self.capsules.iter().any(|b| !self.capsule_reports.contains_key(&b.digest)) {
+            self.verify_capsules();
+        }
+    }
+
+    /// Load and check the selected Capsule under the trust policy, then show its run popup. Background, because
+    /// checking reads the whole payload.
+    fn open_run_capsule(&mut self) {
+        let Some(built) = self.current_capsule().cloned() else { return };
+        if self.job.is_some() {
+            self.say("wait for the current job to finish", WARN);
+            return;
+        }
+        self.job = Some(format!("checking {}…", built.reference()));
+        let (store, tx) = (self.capsule_store.clone(), self.events_tx.clone());
+        self.handle.spawn_blocking(move || {
+            let result = capsulerun::prepare(&store, &built, false).map(Box::new).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::CapsuleReady(result));
+        });
+    }
+
+    /// The popup for a prepared Capsule: its requests are what Enter grants.
+    fn show_run_popup(&mut self, prepared: Box<Prepared>) {
+        let declares = prepared.capsule.spec.interfaces.workspace.is_some();
+        let workspace = if declares { self.suggested_workspace() } else { String::new() };
+        let name = capsulerun::default_box_name(&prepared.capsule, declares.then(|| std::path::Path::new(&workspace)));
+        let grants = prepared.requested();
+        self.mode = Mode::RunCapsule(Box::new(RunCapsule { prepared: *prepared, name, workspace, field: 0, grants }));
+    }
+
+    /// Make the box in the background. The grants shown in the popup become its whole network policy.
+    fn create_capsule_box(&mut self, run: RunCapsule) {
+        let RunCapsule { prepared, name, workspace, grants, .. } = run;
+        let name = name.trim().to_owned();
+        let given = (!workspace.trim().is_empty()).then(|| PathBuf::from(workspace.trim()));
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let workspace = match capsulerun::workspace_for(&prepared.capsule, given.as_deref(), &cwd) {
+            Ok(w) => w,
+            Err(e) => return self.say(format!("{e:#}"), BAD),
+        };
+        self.job = Some(format!("creating {name}…"));
+        let (store, tx) = (self.capsule_store.clone(), self.events_tx.clone());
+        self.handle.spawn_blocking(move || {
+            let progress = |line: &str| {
+                let _ = tx.send(AppEvent::Progress(line.to_owned()));
+            };
+            let opts = capsulerun::Options { name: name.clone(), workspace, ports: Vec::new(), cpus: None, memory_mb: None, auto_stop: None, grants };
+            let result = capsulerun::create_box(&store, prepared, opts, &progress).map(|_| name);
+            let _ = tx.send(AppEvent::Created(result.map_err(|e| format!("{e:#}"))));
+        });
+    }
+
+    fn remove_capsule(&mut self, reference: &str) {
+        match self.capsule_store.remove(reference) {
+            Ok(b) => {
+                self.capsule_reports.remove(&b.digest);
+                self.refresh_store();
+                self.say(format!("removed {}", b.reference()), WARN);
+            }
+            Err(e) => self.say(format!("{e:#}"), BAD),
+        }
     }
 
     /// Fetch the kit list from Docker Hub in the background.
@@ -619,6 +753,20 @@ impl App {
                         Err(e) => self.say(e, BAD),
                     }
                 }
+                AppEvent::Verified(result) => {
+                    self.verifying = false;
+                    match result {
+                        Ok(reports) => self.capsule_reports = reports.into_iter().collect(),
+                        Err(e) => self.say(format!("couldn't check Capsules: {e}"), BAD),
+                    }
+                }
+                AppEvent::CapsuleReady(result) => {
+                    self.job = None;
+                    match result {
+                        Ok(prepared) => self.show_run_popup(prepared),
+                        Err(e) => self.say(e, BAD),
+                    }
+                }
                 AppEvent::Catalog(result) => {
                     self.catalog_loading = false;
                     match result {
@@ -636,6 +784,10 @@ impl App {
         }
         self.last_tick = Instant::now();
         self.refresh_store();
+        if self.tab == Tab::Capsules {
+            // a Capsule built or pulled while the tab is open gets checked too
+            self.ensure_verified();
+        }
         // Every few seconds: is a box we aren't running open somewhere else? (A brief exclusive open, so not too often)
         let check_elsewhere = self.ticks.is_multiple_of(5);
         self.ticks += 1;
@@ -856,6 +1008,10 @@ impl App {
         if tab == Tab::Kits && self.catalog.is_empty() {
             self.load_catalog();
         }
+        if tab == Tab::Capsules {
+            // opening the tab re-checks everything, so a signature or trust change made elsewhere shows
+            self.verify_capsules();
+        }
     }
 
     /// Returns true to quit.
@@ -938,6 +1094,33 @@ impl App {
                 }
                 return false;
             }
+            Mode::ConfirmRemoveCapsule(reference) => {
+                let reference = reference.clone();
+                self.mode = Mode::Normal;
+                if key.code == KeyCode::Char('y') {
+                    self.remove_capsule(&reference);
+                }
+                return false;
+            }
+            Mode::RunCapsule(run) => {
+                let fields = if run.has_workspace() { 2 } else { 1 };
+                let buf = if run.field == 0 { &mut run.name } else { &mut run.workspace };
+                match key.code {
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    KeyCode::Tab | KeyCode::Down | KeyCode::Up => run.field = (run.field + 1) % fields,
+                    KeyCode::Backspace => {
+                        buf.pop();
+                    }
+                    KeyCode::Char(c) => buf.push(c),
+                    KeyCode::Enter if !run.name.trim().is_empty() => {
+                        if let Mode::RunCapsule(run) = std::mem::replace(&mut self.mode, Mode::Normal) {
+                            self.create_capsule_box(*run);
+                        }
+                    }
+                    _ => {}
+                }
+                return false;
+            }
             Mode::ChooseAction(pattern) => {
                 let pattern = pattern.clone();
                 let action = match key.code {
@@ -975,7 +1158,7 @@ impl App {
                 let i = TABS.iter().position(|(t, _)| *t == self.tab).unwrap_or(0);
                 self.set_tab(TABS[(i + TABS.len() - 1) % TABS.len()].0);
             }
-            KeyCode::Char(c @ '1'..='7') => self.set_tab(TABS[(c as u8 - b'1') as usize].0),
+            KeyCode::Char(c @ '1'..='8') => self.set_tab(TABS[(c as u8 - b'1') as usize].0),
             KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Boxes,
             KeyCode::Right | KeyCode::Char('l') => self.focus = Focus::Main,
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
@@ -1007,6 +1190,23 @@ impl App {
                 }
             }
             KeyCode::Char('R') if self.tab == Tab::Kits => self.load_catalog(),
+            KeyCode::Enter if self.tab == Tab::Capsules => self.open_run_capsule(),
+            KeyCode::Char('v') if self.tab == Tab::Capsules => {
+                self.capsule_reports.clear();
+                self.verify_capsules();
+                self.say("checking Capsules: files, payload and signatures", DIM);
+            }
+            KeyCode::Char('R') if self.tab == Tab::Capsules => {
+                self.refresh_store();
+                self.say("rescanned Capsules", DIM);
+            }
+            KeyCode::Char('d') | KeyCode::Delete if self.tab == Tab::Capsules => {
+                if let Some(b) = self.current_capsule() {
+                    self.mode = Mode::ConfirmRemoveCapsule(b.reference());
+                }
+            }
+            KeyCode::Char('[') if self.tab == Tab::Capsules => self.detail_scroll = self.detail_scroll.saturating_sub(3),
+            KeyCode::Char(']') if self.tab == Tab::Capsules => self.detail_scroll = self.detail_scroll.saturating_add(3),
             KeyCode::Char('d') | KeyCode::Delete if self.tab == Tab::Templates => self.delete_template(),
             KeyCode::Char('a') => {
                 if let Some(b) = self.current() {
@@ -1214,15 +1414,27 @@ impl App {
         // Info header
         let lines = match self.current() {
             _ if !self.tab.per_box() => vec![
-                Line::from(vec!["Images ".bold().fg(ACCENT), format!("{} pulled   ", self.pulled.len()).into(), "Templates ".bold().fg(ACCENT), self.templates.len().to_string().into()]),
+                Line::from(vec![
+                    "Images ".bold().fg(ACCENT),
+                    format!("{} pulled   ", self.pulled.len()).into(),
+                    "Capsules ".bold().fg(ACCENT),
+                    format!("{}   ", self.capsules.len()).into(),
+                    "Templates ".bold().fg(ACCENT),
+                    self.templates.len().to_string().into(),
+                ]),
                 Line::from(
                     format!("{}", elpis::session::debug_root().display()).fg(DIM),
                 ),
             ],
             Some(entry) => {
                 let r = entry.rt.lock().unwrap();
+                let from_capsule = entry.work.source.as_deref().filter(|s| s.starts_with("capsule ")).map(|s| format!("   {s}"));
                 vec![
-                    Line::from(vec![entry.work.name.clone().bold().fg(ACCENT), format!("   {}", entry.work.path.display()).fg(DIM)]),
+                    Line::from(vec![
+                        entry.work.name.clone().bold().fg(ACCENT),
+                        format!("   {}", entry.work.path.display()).fg(DIM),
+                        from_capsule.unwrap_or_default().fg(GOOD),
+                    ]),
                     match (&r.status, r.shim_pid, &r.address) {
                         (Status::Running, Some(pid), Some(addr)) => Line::from(vec![
                             "shim pid ".fg(DIM),
@@ -1275,6 +1487,7 @@ impl App {
             Tab::Logs => self.draw_logs(f, content, border),
             Tab::Ports => self.draw_ports(f, content, border),
             Tab::Kits => self.draw_kits(f, content, border),
+            Tab::Capsules => self.draw_capsules(f, content, border),
             Tab::Templates => self.draw_templates(f, content, border),
         }
     }
@@ -1507,6 +1720,58 @@ impl App {
         );
     }
 
+    fn draw_capsules(&mut self, f: &mut Frame, area: Rect, border: Style) {
+        let title = Line::from(vec![" Capsules ".into(), " Enter run · v verify · d remove · R rescan · [ ] scroll ".fg(DIM)]);
+        if self.capsules.is_empty() {
+            self.rows = 0;
+            let text = vec![
+                Line::from("No Capsules yet.").fg(DIM),
+                Line::from(""),
+                Line::from("A Capsule is a portable agent: its image, files and start command, plus what it asks for (network, host access).").fg(DIM),
+                Line::from("Build one with `elpis-run capsule build DIR`, or fetch one with `elpis-run capsule pull REGISTRY/NAMESPACE/NAME:VERSION`.").fg(DIM),
+                Line::from("They show up here with who vouches for them; Enter shows what it asks for and runs it only after you grant it.").fg(DIM),
+            ];
+            f.render_widget(Paragraph::new(text).block(Self::table_block(title, border)), area);
+            return;
+        }
+        // the table on top, sized to its rows; the selected Capsule's details and verification below
+        let table_height = (self.capsules.len() as u16 + 3).clamp(5, (area.height / 2).max(5));
+        let [table_area, detail_area] = Layout::vertical([Constraint::Length(table_height), Constraint::Min(0)]).areas(area);
+        self.hits.table = Some(table_area);
+        let rows: Vec<Row> = self
+            .capsules
+            .iter()
+            .map(|b| {
+                let (trust, color) = trust_cell(self.capsule_reports.get(&b.digest));
+                let origin = b.origin.as_deref().map_or("built here".to_owned(), |o| format!("from {}", o.split('/').next().unwrap_or(o)));
+                Row::new(vec![
+                    Cell::from(b.reference()).bold(),
+                    Cell::from(trust).fg(color),
+                    Cell::from(b.payload_files.to_string()),
+                    Cell::from(display_safe(&origin)).fg(DIM),
+                    Cell::from(display_safe(&b.description)).fg(DIM),
+                ])
+            })
+            .collect();
+        self.render_table(
+            f,
+            table_area,
+            vec!["Capsule", "Trust", "Files", "Origin", "Description"],
+            rows,
+            vec![Constraint::Min(28), Constraint::Length(22), Constraint::Length(6), Constraint::Length(18), Constraint::Min(12)],
+            Self::table_block(title, border),
+        );
+
+        let Some(selected) = self.table.selected().and_then(|i| self.capsules.get(i)).cloned() else { return };
+        if self.detail_for != selected.digest {
+            self.detail_for = selected.digest.clone();
+            self.detail_scroll = 0;
+        }
+        let lines = capsule_detail(&selected, self.capsule_reports.get(&selected.digest));
+        let block = Self::table_block(Line::from(format!(" {} ", selected.reference())).bold(), Style::new().fg(DIM));
+        f.render_widget(Paragraph::new(lines).block(block).scroll((self.detail_scroll, 0)), detail_area);
+    }
+
     fn draw_templates(&mut self, f: &mut Frame, area: Rect, border: Style) {
         let title = Line::from(vec![" Templates ".into(), " Enter new box · d delete · T saves the selected box ".fg(DIM)]);
         if self.templates.is_empty() {
@@ -1561,6 +1826,7 @@ impl App {
             Tab::Ports => &[("s", "start"), ("x", "stop"), ("n", "publish"), ("d", "remove"), ("tab", "tabs"), ("q", "quit")],
             Tab::Logs => &[("s", "start"), ("x", "stop"), ("o", "agent"), ("t", "shell"), ("A", "auto-stop"), ("X", "delete box"), ("tab", "tabs"), ("q", "quit")],
             Tab::Kits => &[("enter", "new box"), ("p", "pull"), ("R", "refresh"), ("a", "copy box"), ("tab", "tabs"), ("q", "quit")],
+            Tab::Capsules => &[("enter", "run"), ("v", "verify"), ("d", "remove"), ("R", "rescan"), ("[ ]", "scroll"), ("tab", "tabs"), ("q", "quit")],
             Tab::Templates => &[("enter", "new box"), ("d", "delete"), ("T", "save selected box"), ("tab", "tabs"), ("q", "quit")],
         };
         let mut spans = vec![Span::raw(" ")];
@@ -1572,6 +1838,22 @@ impl App {
     }
 
     fn draw_popup(&self, f: &mut Frame) {
+        if let Mode::RunCapsule(run) = &self.mode {
+            let area = f.area();
+            let lines = run_popup_lines(run);
+            let w = 84.min(area.width.saturating_sub(4));
+            // wrapped lines take more than one row each: borders and margins take 4 columns
+            let text_width = w.saturating_sub(4).max(1) as usize;
+            let rows: usize = lines.iter().map(|l| l.width().div_ceil(text_width).max(1)).sum();
+            let height = (rows as u16 + 2).min(area.height.saturating_sub(2));
+            let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + area.height.saturating_sub(height) / 3, width: w, height };
+            f.render_widget(Clear, popup);
+            let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(ACCENT)).title(" Run Capsule ".bold());
+            let inner = block.inner(popup);
+            f.render_widget(block, popup);
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner.inner(Margin { horizontal: 1, vertical: 0 }));
+            return;
+        }
         if let Mode::NewBox { source, name, workspace, field, docker } = &self.mode {
             let area = f.area();
             let w = 76.min(area.width.saturating_sub(4));
@@ -1601,7 +1883,12 @@ impl App {
             return;
         }
         let (title, prompt, value) = match &self.mode {
-            Mode::Normal | Mode::NewBox { .. } => return,
+            Mode::Normal | Mode::NewBox { .. } | Mode::RunCapsule(_) => return,
+            Mode::ConfirmRemoveCapsule(r) => (
+                " Remove Capsule ",
+                format!("Remove {r} from your store? Boxes already made from it keep working; a registry copy is untouched."),
+                "[y] remove    any other key cancels".to_owned(),
+            ),
             Mode::SaveTemplate(v) => (
                 " Save as template ",
                 format!("Template name for {} (the box must be stopped):", self.current().map(|b| b.work.name.as_str()).unwrap_or("?")),
@@ -1634,6 +1921,111 @@ impl App {
             inner.inner(Margin { horizontal: 1, vertical: 0 }),
         );
     }
+}
+
+/// The Trust column for a Capsule: short, and coloured by how much to rely on it.
+fn trust_cell(report: Option<&Report>) -> (String, Color) {
+    let Some(r) = report else { return ("checking…".to_owned(), DIM) };
+    if !r.intact() {
+        return ("✗ modified".to_owned(), BAD);
+    }
+    let trusted = r.trusted_signers();
+    if !trusted.is_empty() {
+        return (format!("✓ {}", display_safe(&trusted.join(", "))), GOOD);
+    }
+    let valid = r.signatures.iter().filter(|s| !matches!(s.standing, Standing::Invalid(_))).count();
+    match (r.signatures.len(), valid) {
+        (0, _) => ("unsigned".to_owned(), DIM),
+        (_, 0) => ("✗ bad signature".to_owned(), BAD),
+        _ => ("signed, untrusted".to_owned(), WARN),
+    }
+}
+
+fn verdict_color(report: Option<&Report>) -> Color {
+    trust_cell(report).1
+}
+
+/// The detail pane: the manifest's summary (what it runs and asks for), then how it verified.
+fn capsule_detail(built: &Built, report: Option<&Report>) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    // the manifest only, for display: whether the stored files are intact is the verification's job below
+    match std::fs::read_to_string(built.path.join(elpis::capsulestore::MANIFEST_FILE)).map_err(|e| e.to_string()).and_then(|t| Capsule::parse(&t).map_err(|e| format!("{e:#}"))) {
+        Ok(capsule) => {
+            for (i, l) in capsule.summary(Some(&built.digest)).lines().enumerate() {
+                lines.push(if i == 0 { Line::from(l.to_owned()).bold().fg(ACCENT) } else { Line::from(l.to_owned()) });
+            }
+        }
+        Err(e) => lines.push(Line::from(format!("the manifest can't be read: {}", display_safe(&e))).fg(BAD)),
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("Verification".bold().fg(ACCENT)));
+    let Some(r) = report else {
+        lines.push(Line::from("checking…").fg(DIM));
+        return lines;
+    };
+    for c in &r.checks {
+        lines.push(match &c.result {
+            Ok(detail) => Line::from(vec!["  ok    ".fg(GOOD), format!("{} ({})", c.name, display_safe(detail)).into()]),
+            Err(why) => Line::from(vec!["  FAIL  ".fg(BAD), format!("{}: {}", c.name, display_safe(why)).into()]),
+        });
+    }
+    lines.push(match &r.provenance {
+        None => Line::from("  source: not recorded (not built from a git repository)").fg(DIM),
+        Some(p) => Line::from(format!(
+            "  source: {} @ {}{}",
+            display_safe(p.git.as_deref().unwrap_or("(no remote)")),
+            display_safe(p.commit.as_deref().unwrap_or("?")),
+            if p.dirty { "  (built with uncommitted changes)" } else { "" }
+        ))
+        .fg(DIM),
+    });
+    if r.signatures.is_empty() {
+        lines.push(Line::from("  signatures: none").fg(DIM));
+    }
+    for s in &r.signatures {
+        let (text, color) = match &s.standing {
+            Standing::Trusted(name) => (format!("valid, by {}, whom you trust for this namespace", display_safe(name)), GOOD),
+            Standing::OutOfScope(name) => (format!("valid, by {}, but you don't trust that key for this namespace", display_safe(name)), WARN),
+            Standing::Unknown => (format!("valid, by a key you haven't trusted ({})", s.public_key), WARN),
+            Standing::Invalid(why) => (format!("INVALID: {}", display_safe(why)), BAD),
+        };
+        lines.push(Line::from(vec![format!("  signature {}: ", s.key_id).fg(DIM), text.fg(color)]));
+    }
+    lines.push(Line::from(vec!["  verdict: ".fg(DIM), r.verdict().fg(verdict_color(report)).bold()]));
+    lines
+}
+
+/// What the run popup shows: who vouches for the Capsule, what it asks for (which Enter grants) and the box fields.
+fn run_popup_lines(run: &RunCapsule) -> Vec<Line<'static>> {
+    let capsule = &run.prepared.capsule;
+    let cursor = |on: bool, v: &str| if on { format!("{v}█") } else { v.to_owned() };
+    let mut lines = vec![
+        Line::from(capsule.reference()).bold().fg(ACCENT),
+        Line::from(vec!["Standing  ".fg(DIM), run.prepared.report.verdict().fg(verdict_color(Some(&run.prepared.report)))]),
+        Line::from(""),
+        Line::from("It asks for (Enter grants exactly this; anything else stays blocked):").fg(DIM),
+    ];
+    if run.grants.network.is_empty() {
+        lines.push(Line::from(vec!["  network  ".fg(DIM), "none: the box will be offline".fg(WARN)]));
+    } else {
+        lines.push(Line::from(vec!["  network  ".fg(DIM), display_safe(&run.grants.network.join(", ")).fg(GOOD)]));
+    }
+    if run.grants.host_access {
+        lines.push(Line::from(vec!["  host     ".fg(DIM), "access to this Windows machine's services".fg(WARN)]));
+    }
+    let credentials = &capsule.spec.requests.credentials;
+    if !credentials.is_empty() {
+        let services: Vec<&str> = credentials.iter().map(|c| c.service.as_str()).collect();
+        lines.push(Line::from(format!("  credentials requested ({}) aren't injected yet; the agent signs in itself", display_safe(&services.join(", ")))).fg(DIM));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec!["Box name   ".fg(DIM), cursor(run.field == 0, &run.name).bold()]));
+    if run.has_workspace() {
+        lines.push(Line::from(vec!["Workspace  ".fg(DIM), cursor(run.field == 1, &run.workspace).bold()]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(if run.has_workspace() { "Tab switches field · Enter grants and creates · Esc cancels" } else { "Enter grants and creates · Esc cancels" }).fg(DIM));
+    lines
 }
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
@@ -1681,4 +2073,294 @@ fn main() -> Result<()> {
     // Background tasks (finished VM owners, blocking readers) mustn't hold the process open
     runtime.shutdown_timeout(Duration::from_secs(2));
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use elpis::capsulesign::{Check, SignatureReport, Trust};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::{Mutex, Once};
+
+    const DIGEST: &str = "docker.io/library/alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// Every test shares one data folder (ELPIS_HOME), so none of them touches the real one; the lock keeps
+    /// tests that change shared state (the trust policy, the Capsule store) from overlapping.
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    fn home() -> PathBuf {
+        static ONCE: Once = Once::new();
+        let dir = std::env::temp_dir().join(format!("elpis-tui-test-{}", std::process::id()));
+        ONCE.call_once(|| {
+            std::fs::create_dir_all(&dir).unwrap();
+            // SAFETY: first thing every test does, under LOCK, before anything else reads the environment
+            unsafe { std::env::set_var("ELPIS_HOME", &dir) };
+        });
+        dir
+    }
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = home();
+        let _ = std::fs::remove_file(home.join("capsule-trust.json")); // each test starts with the default policy
+        guard
+    }
+
+    fn app() -> (App, tokio::runtime::Runtime) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        (App::new(runtime.handle().clone()), runtime)
+    }
+
+    /// Build a Capsule named `tuitest/NAME` into the shared store.
+    fn capsule(name: &str, meta_extra: &str, spec_extra: &str) -> Built {
+        let src = home().join(format!("src-{name}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(src.join("agent")).unwrap();
+        std::fs::write(src.join("agent/run.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::write(
+            src.join("capsule.yaml"),
+            format!("apiVersion: elpis.dev/v1alpha1\nkind: Capsule\nmetadata: {{ name: tuitest/{name}, version: 1.0.0{meta_extra} }}\nspec:\n  runtime: {{ image: {DIGEST}, entrypoint: [/opt/agent/run.sh] }}\n  payload: [{{ from: ./agent, to: /opt/agent }}]\n{spec_extra}"),
+        )
+        .unwrap();
+        CapsuleStore::open().build(&src, true).unwrap()
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// Drive the app's event loop until `done` holds.
+    fn wait(app: &mut App, what: &str, done: impl Fn(&App) -> bool) {
+        let started = Instant::now();
+        while !done(app) {
+            assert!(started.elapsed() < Duration::from_secs(20), "timed out waiting for {what}");
+            app.tick();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn render(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..h).map(|y| (0..w).map(|x| buffer[(x, y)].symbol().to_owned()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    fn select(app: &mut App, built: &Built) {
+        let i = app.capsules.iter().position(|b| b.digest == built.digest).expect("the Capsule is in the list");
+        app.table.select(Some(i));
+    }
+
+    fn open_tab(app: &mut App, built: &Built) {
+        app.refresh_store();
+        app.set_tab(Tab::Capsules);
+        wait(app, "verification", |a| !a.verifying && a.capsule_reports.contains_key(&built.digest));
+        select(app, built);
+    }
+
+    fn report(checks_ok: bool, signatures: Vec<Standing>) -> Report {
+        Report {
+            reference: "tuitest/x@1.0.0".into(),
+            digest: "sha256:abc".into(),
+            checks: vec![Check { name: "files", result: if checks_ok { Ok("fine".into()) } else { Err("modified".into()) } }],
+            signatures: signatures.into_iter().map(|standing| SignatureReport { key_id: "0123456789abcdef".into(), public_key: "ed25519:x".into(), standing, statement: None }).collect(),
+            provenance: None,
+        }
+    }
+
+    // ------------------------------------------------------------ pure pieces
+
+    #[test]
+    fn the_trust_column_says_how_far_to_rely_on_a_capsule() {
+        assert_eq!(trust_cell(None), ("checking…".to_owned(), DIM));
+        assert_eq!(trust_cell(Some(&report(true, vec![]))), ("unsigned".to_owned(), DIM));
+        assert_eq!(trust_cell(Some(&report(true, vec![Standing::Unknown]))), ("signed, untrusted".to_owned(), WARN));
+        assert_eq!(trust_cell(Some(&report(true, vec![Standing::OutOfScope("bob".into())]))), ("signed, untrusted".to_owned(), WARN));
+        assert_eq!(trust_cell(Some(&report(true, vec![Standing::Invalid("forged".into())]))), ("✗ bad signature".to_owned(), BAD));
+        assert_eq!(trust_cell(Some(&report(true, vec![Standing::Invalid("x".into()), Standing::Trusted("alice".into())]))), ("✓ alice".to_owned(), GOOD));
+        // a modified Capsule is never "trusted", whoever signed it
+        assert_eq!(trust_cell(Some(&report(false, vec![Standing::Trusted("alice".into())]))), ("✗ modified".to_owned(), BAD));
+    }
+
+    // ------------------------------------------------------------ the tab
+
+    #[test]
+    fn tabs_are_numbered_and_capsules_is_one_of_them() {
+        let _g = lock();
+        let (mut app, _rt) = app();
+        press(&mut app, KeyCode::Char('7'));
+        assert!(app.tab == Tab::Capsules && app.focus == Focus::Main);
+        press(&mut app, KeyCode::Char('8'));
+        assert!(app.tab == Tab::Templates);
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("Capsules") && screen.contains("Templates"), "{screen}");
+    }
+
+    #[test]
+    fn the_tab_lists_capsules_with_their_standing_and_details() {
+        let _g = lock();
+        let built = capsule("lister", ", description: \"Reviews things for the TUI test\"", "  requests: { network: { allow: [example.com] } }\n");
+        let (mut app, _rt) = app();
+        open_tab(&mut app, &built);
+        let screen = render(&mut app, 150, 44);
+        for want in ["tuitest/lister@1.0.0", "unsigned", "Reviews things for the TUI test", "built here", "Verification", "ok    manifest and payload match", "asks for", "example.com", "verdict: unsigned: nobody vouches"] {
+            assert!(screen.contains(want), "missing {want:?} in:\n{screen}");
+        }
+        // an empty store explains itself instead
+        let (mut empty, _rt2) = app_with_empty_store();
+        empty.set_tab(Tab::Capsules);
+        assert!(render(&mut empty, 120, 30).contains("No Capsules yet"));
+    }
+
+    fn app_with_empty_store() -> (App, tokio::runtime::Runtime) {
+        let (mut app, rt) = app();
+        app.capsules.clear();
+        app.capsule_store = CapsuleStore::at(home().join("no-such-capsule-store"));
+        (app, rt)
+    }
+
+    #[test]
+    fn a_trusted_signature_shows_who_vouches() {
+        let _g = lock();
+        let built = capsule("signed", "", "");
+        let (key, public) = elpis::capsulesign::generate().map(|(k, p)| (k, elpis::capsulesign::public_key_string(&p))).unwrap();
+        CapsuleStore::open().add_signature(&built, &elpis::capsulesign::sign(&key, &built).unwrap()).unwrap();
+        let mut trust = Trust::default();
+        trust.add("alice", &public, &["tuitest".into()]).unwrap();
+        trust.save().unwrap();
+
+        let (mut app, _rt) = app();
+        open_tab(&mut app, &built);
+        let screen = render(&mut app, 150, 44);
+        assert!(screen.contains("✓ alice") && screen.contains("whom you trust for this namespace") && screen.contains("signed by alice (trusted)"), "{screen}");
+    }
+
+    #[test]
+    fn a_modified_capsule_is_flagged_in_the_list_and_the_details() {
+        let _g = lock();
+        let built = capsule("tampered", "", "");
+        std::fs::write(built.payload_path().unwrap(), b"swapped").unwrap();
+        let (mut app, _rt) = app();
+        open_tab(&mut app, &built);
+        let screen = render(&mut app, 150, 44);
+        assert!(screen.contains("✗ modified") && screen.contains("FAIL") && screen.contains("INTEGRITY CHECK FAILED"), "{screen}");
+        // and it can't be run
+        press(&mut app, KeyCode::Enter);
+        wait(&mut app, "the refusal", |a| a.job.is_none() && a.message.is_some());
+        assert!(app.message.as_ref().unwrap().0.contains("integrity check") || app.message.as_ref().unwrap().0.contains("modified"), "{:?}", app.message);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn manifest_text_cannot_drive_the_terminal() {
+        let _g = lock();
+        // an ESC byte in the description (YAML "\e") and in the entrypoint
+        let built = capsule("hostile", ", description: \"bad \\e[2J text\"", "");
+        let (mut app, _rt) = app();
+        open_tab(&mut app, &built);
+        let screen = render(&mut app, 150, 44);
+        assert!(!screen.contains('\u{1b}'), "an escape byte reached the screen buffer");
+        assert!(screen.contains("bad ?[2J text"));
+    }
+
+    // ------------------------------------------------------------ running
+
+    #[test]
+    fn enter_shows_what_a_capsule_asks_for_before_anything_is_created() {
+        let _g = lock();
+        let built = capsule("asker", "", "  requests:\n    network: { allow: [example.com, \"*.example.org\"] }\n    hostAccess: true\n    credentials: [{ service: anthropic, auth: [apiKey] }]\n");
+        let (mut app, _rt) = app();
+        open_tab(&mut app, &built);
+        press(&mut app, KeyCode::Enter);
+        wait(&mut app, "the run popup", |a| matches!(a.mode, Mode::RunCapsule(_)));
+        let screen = render(&mut app, 120, 40);
+        for want in ["Run Capsule", "tuitest/asker@1.0.0", "Standing", "unsigned", "example.com, *.example.org", "Windows machine's services", "credentials requested (anthropic)", "Box name", "asker", "Enter grants and creates"] {
+            assert!(screen.contains(want), "missing {want:?} in:\n{screen}");
+        }
+        assert!(!screen.contains("Workspace"), "this Capsule declares no workspace");
+        // the grants are the Capsule's requests, no more
+        let Mode::RunCapsule(run) = &app.mode else { unreachable!() };
+        assert_eq!((run.grants.network.len(), run.grants.host_access), (2, true));
+
+        // editing the name, then cancelling: nothing is made
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        for c in "mybox".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert!(render(&mut app, 120, 40).contains("mybox█"));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal) && app.job.is_none());
+        assert!(!home().join("mybox").exists() && !home().join("asker").exists());
+    }
+
+    #[test]
+    fn a_capsule_with_a_workspace_gets_a_second_field() {
+        let _g = lock();
+        let built = capsule("worker", "", "  interfaces:\n    workspace: { path: /work }\n");
+        let (mut app, _rt) = app();
+        open_tab(&mut app, &built);
+        press(&mut app, KeyCode::Enter);
+        wait(&mut app, "the run popup", |a| matches!(a.mode, Mode::RunCapsule(_)));
+        assert!(render(&mut app, 120, 40).contains("Workspace"));
+        press(&mut app, KeyCode::Tab);
+        let Mode::RunCapsule(run) = &app.mode else { unreachable!() };
+        assert_eq!(run.field, 1);
+        // an empty name can't be confirmed
+        press(&mut app, KeyCode::Esc);
+    }
+
+    #[test]
+    fn a_policy_that_requires_signatures_refuses_an_unsigned_capsule_here_too() {
+        let _g = lock();
+        let built = capsule("strict", "", "");
+        Trust { require_signed: true, ..Default::default() }.save().unwrap();
+        let (mut app, _rt) = app();
+        open_tab(&mut app, &built);
+        press(&mut app, KeyCode::Enter);
+        wait(&mut app, "the refusal", |a| a.job.is_none() && a.message.is_some());
+        let (text, color, _) = app.message.clone().unwrap();
+        assert!(text.contains("requires that") && color == BAD, "{text}");
+        assert!(matches!(app.mode, Mode::Normal), "no popup, so no way to grant it");
+        std::fs::remove_file(home().join("capsule-trust.json")).unwrap();
+    }
+
+    // ------------------------------------------------------------ removing
+
+    #[test]
+    fn removing_a_capsule_asks_first() {
+        let _g = lock();
+        let built = capsule("doomed", "", "");
+        let (mut app, _rt) = app();
+        open_tab(&mut app, &built);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(matches!(&app.mode, Mode::ConfirmRemoveCapsule(r) if r == "tuitest/doomed@1.0.0"));
+        assert!(render(&mut app, 120, 30).contains("Remove tuitest/doomed@1.0.0"));
+        press(&mut app, KeyCode::Char('n')); // anything but y cancels
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(CapsuleStore::open().find("tuitest/doomed@1.0.0").is_ok());
+
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(CapsuleStore::open().find("tuitest/doomed@1.0.0").is_err());
+        assert!(!app.capsules.iter().any(|b| b.name == "tuitest/doomed"));
+    }
+
+    #[test]
+    fn the_verify_key_rechecks_everything() {
+        let _g = lock();
+        let built = capsule("rechecked", "", "");
+        let (mut app, _rt) = app();
+        open_tab(&mut app, &built);
+        assert!(trust_cell(app.capsule_reports.get(&built.digest)).0 == "unsigned");
+        // signing elsewhere (the CLI) then pressing v shows the new signature
+        let (key, _) = elpis::capsulesign::generate().unwrap();
+        CapsuleStore::open().add_signature(&built, &elpis::capsulesign::sign(&key, &built).unwrap()).unwrap();
+        press(&mut app, KeyCode::Char('v'));
+        assert!(app.capsule_reports.is_empty() || app.verifying, "results are dropped while re-checking");
+        wait(&mut app, "re-verification", |a| !a.verifying && a.capsule_reports.contains_key(&built.digest));
+        assert_eq!(trust_cell(app.capsule_reports.get(&built.digest)).0, "signed, untrusted");
+    }
 }

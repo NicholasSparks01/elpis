@@ -1125,20 +1125,7 @@ async fn capsule(action: CapsuleAction, log: &Log) -> Result<i32> {
 
 /// One line on who vouches for a Capsule, in terms of the consumer's policy.
 fn standing_line(report: &elpis::capsulesign::Report) -> String {
-    use elpis::capsulesign::Standing;
-    if !report.intact() {
-        return "INTEGRITY CHECK FAILED: the stored files no longer match the build (see `capsule verify`)".to_owned();
-    }
-    let signers = report.trusted_signers();
-    if !signers.is_empty() {
-        return format!("signed by {} (trusted)", signers.join(", "));
-    }
-    let valid = report.signatures.iter().filter(|s| !matches!(s.standing, Standing::Invalid(_))).count();
-    match (report.signatures.len(), valid) {
-        (0, _) => "unsigned: nobody vouches for it".to_owned(),
-        (_, 0) => "has signatures, but none is valid for this Capsule".to_owned(),
-        _ => "signed, but not by a key you trust (`capsule verify` shows who)".to_owned(),
-    }
+    report.verdict()
 }
 
 fn print_report(report: &elpis::capsulesign::Report) {
@@ -1174,12 +1161,6 @@ fn print_report(report: &elpis::capsulesign::Report) {
     println!("  verdict: {}", standing_line(report));
 }
 
-/// A box name from the parts: letters, digits and hyphens, at most 40 characters.
-fn box_name(parts: &[&str]) -> String {
-    let joined: String = parts.join("-").chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-    joined.chars().take(40).collect::<String>().trim_matches('-').to_owned()
-}
-
 fn confirm(question: &str) -> Result<bool> {
     use std::io::Write;
     print!("{question} [y/N] ");
@@ -1193,38 +1174,18 @@ fn confirm(question: &str) -> Result<bool> {
 /// whose network policy is exactly the grants, and open the agent. An existing box from the same build is reused.
 async fn capsule_run(args: CapsuleRunArgs, log: &Log) -> Result<i32> {
     use elpis::capsule::Lock;
+    use elpis::capsulerun;
     use elpis::capsulestore::Store;
-    use elpis::workdir::CapsuleLaunch;
 
     let store = Store::open();
     let built = store.find(&args.reference)?;
-    let capsule = store.load(&built)?; // checks the stored files still match the build
-    // Who vouches for it, by the consumer's own policy. Checked before anything is asked or created.
-    let trust = elpis::capsulesign::Trust::load()?;
-    let report = elpis::capsulesign::verify(&store, &built, &trust);
-    if !report.intact() {
-        anyhow::bail!("{} failed its integrity check; run `elpis-run capsule verify {}` for details", capsule.reference(), capsule.reference());
-    }
-    if trust.require_signed && !report.is_trusted() && !args.allow_unsigned {
-        anyhow::bail!(
-            "{} is not signed by a key you trust ({}), and your policy requires that. Trust its signer (`capsule trust add`), turn the requirement off (`capsule trust require off`), or pass --allow-unsigned for this run",
-            capsule.reference(),
-            standing_line(&report)
-        );
-    }
-    if !capsule.compatible_with(env!("CARGO_PKG_VERSION"))? {
-        anyhow::bail!("{} needs a newer Elpis ({})", capsule.reference(), capsule.spec.compatibility.elpis.as_deref().unwrap_or_default());
-    }
+    // Loads the Capsule (checking its files against the build) and applies the consumer's trust policy, before
+    // anything is asked or created
+    let prepared = capsulerun::prepare(&store, &built, args.allow_unsigned)?;
+    let capsule = &prepared.capsule;
 
-    let workspace = match (&args.workspace, capsule.spec.interfaces.workspace.is_some()) {
-        (Some(w), true) => Some(std::path::absolute(w)?),
-        (None, true) => Some(std::env::current_dir()?),
-        (Some(_), false) => anyhow::bail!("{} doesn't declare a workspace, so there is no folder to share; leave the folder out", capsule.reference()),
-        (None, false) => None,
-    };
-    let short = capsule.metadata.name.rsplit('/').next().unwrap_or(&capsule.metadata.name).to_owned();
-    let folder = workspace.as_ref().and_then(|w| w.file_name()).map(|f| f.to_string_lossy().into_owned());
-    let name = args.name.clone().unwrap_or_else(|| box_name(&[&short, folder.as_deref().unwrap_or("")]));
+    let workspace = capsulerun::workspace_for(capsule, args.workspace.as_deref(), &std::env::current_dir()?)?;
+    let name = args.name.clone().unwrap_or_else(|| capsulerun::default_box_name(capsule, workspace.as_deref()));
     if name.is_empty() {
         anyhow::bail!("couldn't make a box name; pass --name");
     }
@@ -1246,8 +1207,8 @@ async fn capsule_run(args: CapsuleRunArgs, log: &Log) -> Result<i32> {
 
     // Requests are not grants: show what would be granted, and nothing is created until it's approved
     let requests = &capsule.spec.requests;
-    let grants = requests.grantable();
-    println!("{}: {}", capsule.reference(), standing_line(&report));
+    let grants = prepared.requested();
+    println!("{}: {}", capsule.reference(), standing_line(&prepared.report));
     println!("  asks for:");
     if grants.network.is_empty() {
         println!("  network   none (the box will be offline)");
@@ -1265,22 +1226,8 @@ async fn capsule_run(args: CapsuleRunArgs, log: &Log) -> Result<i32> {
         anyhow::bail!("not granted; nothing was created");
     }
 
-    let image_ref = capsule.spec.runtime.image.clone();
-    let image = tokio::task::spawn_blocking(move || elpis::registry::pull(&image_ref, &progress)).await??;
-    let payload_layer = {
-        let built = built.clone();
-        tokio::task::spawn_blocking(move || Store::open().payload_layer(&built)).await??
-    };
-
-    println!("creating box {name} from {}", capsule.reference());
-    let launch = CapsuleLaunch { capsule, digest: built.digest.clone(), image, payload_layer, grants };
-    let new = NewBox { workspace, cpus: args.cpus, memory_mb: args.memory, ports, ..NewBox::new(name.clone(), Source::Capsule(Box::new(launch))) };
-    let work = tokio::task::spawn_blocking(move || workdir::create_box(new)).await??;
-    if let Some(secs) = args.auto_stop {
-        let mut file = BoxFile::load_or_default(&work);
-        file.auto_stop = Some(secs);
-        file.save(&work)?;
-    }
+    let opts = capsulerun::Options { name, workspace, ports, cpus: args.cpus, memory_mb: args.memory, auto_stop: args.auto_stop, grants };
+    let work = tokio::task::spawn_blocking(move || capsulerun::create_box(&Store::open(), prepared, opts, &progress)).await??;
     start_and_open(&work, args.shell, log).await
 }
 

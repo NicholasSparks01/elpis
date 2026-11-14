@@ -14,6 +14,7 @@ pub mod b64;
 pub mod boxfile;
 pub mod capsule;
 pub mod capsuleremote;
+pub mod capsulerun;
 pub mod capsulesign;
 pub mod capsulestore;
 pub mod console;

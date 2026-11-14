@@ -153,10 +153,16 @@ elpis-tui.exe
 ```
 
 - **Left:** a card per box: status, uptime, CPU and RAM, size and network counts, and **+ New box**.
-- **Right:** the selected box's tabs: network activity (`b` block, `w` allow a host), network rules (`n` new, `d` delete, `D` cycle the default), filesystem rules (`space` toggles read-only), ports, logs, the agent catalog and templates.
-- **Keys:** `s`/`x` start/stop, `Enter` toggle, `o` agent and `t` shell terminals, `a` copy, `X` delete, `T` save as template, `A` auto-stop, `Tab`/`1`–`7` tabs, `r` rescan, `q` quit. The mouse works too.
+- **Right:** the selected box's tabs: network activity (`b` block, `w` allow a host), network rules (`n` new, `d` delete, `D` cycle the default), filesystem rules (`space` toggles read-only), ports, logs, the agent catalog, Capsules and templates.
+- **Keys:** `s`/`x` start/stop, `Enter` toggle, `o` agent and `t` shell terminals, `a` copy, `X` delete, `T` save as template, `A` auto-stop, `Tab`/`1`–`8` tabs, `r` rescan, `q` quit. The mouse works too.
 
 VMs started from the TUI run inside its process, so quitting stops them.
+
+### Capsules in the TUI
+
+The **Capsules** tab (`7`) lists the Capsules in your store with who vouches for each (`✓ alice` for a trusted signer, `signed, untrusted`, `unsigned`, `✗ modified`), and shows the selected one's details below: what it runs, what it asks for, and its verification (the same checks as `capsule verify`: files against the build, the payload archive, each signature against your trust policy). Opening the tab, or pressing `v`, re-checks everything in the background.
+
+`Enter` runs the selected Capsule, like `capsule run`: it loads and checks it under your trust policy, then shows a popup with its standing and exactly what it asks for. Pressing `Enter` there grants those requests and creates the box (its network policy is default deny plus the granted hosts); `Esc` cancels and nothing is created. The box name, and the workspace for a Capsule that declares one, are editable (`Tab` switches field). Then start the box with `s`, as for any box. A policy that requires signatures (`capsule trust require on`) refuses an unsigned Capsule here too, with no override: use `capsule run --allow-unsigned` for a one-off. `d` removes a Capsule from the store (boxes already made from it keep working), and `[` `]` scroll the details. Building, pulling, signing, trusting, searching and forking stay on the command line, and boxes made from a Capsule show it in their Info header.
 
 ## The GUI
 
