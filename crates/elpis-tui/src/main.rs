@@ -37,11 +37,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CARD_HEIGHT: u16 = 6;
-const ACCENT: Color = Color::Rgb(224, 138, 84);
-const DIM: Color = Color::Rgb(150, 143, 110);
-const GOOD: Color = Color::Rgb(170, 199, 108);
-const BAD: Color = Color::Rgb(238, 139, 124);
-const WARN: Color = Color::Rgb(227, 181, 82);
+const ACCENT: Color = Color::Rgb(63, 185, 80);
+const DIM: Color = Color::Rgb(139, 148, 158);
+const GOOD: Color = Color::Rgb(63, 185, 80);
+const BAD: Color = Color::Rgb(255, 123, 114);
+const WARN: Color = Color::Rgb(210, 153, 34);
 
 // ---------------------------------------------------------------- state
 
@@ -270,11 +270,11 @@ fn log_color(c: LogColor) -> Color {
         "red" => BAD,
         "yellow" | "darkyellow" => WARN,
         "green" | "darkgreen" => GOOD,
-        "cyan" | "darkcyan" => Color::Rgb(143, 196, 177),
-        "magenta" => Color::Rgb(207, 164, 200),
+        "cyan" | "darkcyan" => Color::Rgb(86, 212, 221),
+        "magenta" => Color::Rgb(210, 168, 255),
         "blue" => ACCENT,
-        "gray" => Color::Rgb(169, 162, 124),
-        _ => Color::Rgb(239, 226, 198),
+        "gray" => Color::Rgb(139, 148, 158),
+        _ => Color::Rgb(230, 237, 243),
     }
 }
 
@@ -1393,7 +1393,7 @@ impl App {
         let selected = i == self.selected;
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(if selected { ACCENT } else { Color::Rgb(52, 58, 28) }))
+            .border_style(Style::new().fg(if selected { ACCENT } else { Color::Rgb(33, 38, 45) }))
             .title(Line::from(vec![
                 " ".into(),
                 dot,
@@ -1503,7 +1503,7 @@ impl App {
         }
         let table = Table::new(rows, widths)
             .header(Row::new(header).style(Style::new().fg(DIM).add_modifier(Modifier::BOLD)))
-            .row_highlight_style(Style::new().bg(Color::Rgb(52, 58, 28)).add_modifier(Modifier::BOLD))
+            .row_highlight_style(Style::new().bg(Color::Rgb(33, 38, 45)).add_modifier(Modifier::BOLD))
             .highlight_symbol("▶ ")
             .block(block);
         f.render_stateful_widget(table, area, &mut self.table);
@@ -1527,7 +1527,7 @@ impl App {
                     (Some(Action::Deny), None) => Line::from(vec!["blocked".fg(BAD).bold(), " · default".fg(DIM)]),
                     (Some(Action::Allow), Some(r)) => Line::from(vec!["allowed".fg(GOOD), format!(" · {r}").fg(DIM)]),
                     (Some(Action::Allow), None) => Line::from(vec!["allowed".fg(GOOD), " · default".fg(DIM)]),
-                    (Some(Action::Ask), _) => Line::from("waiting for you".fg(Color::Rgb(207, 164, 200)).bold()),
+                    (Some(Action::Ask), _) => Line::from("waiting for you".fg(Color::Rgb(210, 168, 255)).bold()),
                     (None, _) => Line::from("—".fg(DIM)),
                 };
                 Row::new(vec![
@@ -1575,7 +1575,7 @@ impl App {
             .collect();
         let default = match file.default {
             Action::Deny => "deny".fg(BAD).bold(),
-            Action::Ask => "ask".fg(Color::Rgb(207, 164, 200)).bold(),
+            Action::Ask => "ask".fg(Color::Rgb(210, 168, 255)).bold(),
             Action::Allow => "allow".fg(GOOD).bold(),
         };
         let title = Line::from(vec![" Network rules · default ".into(), default, " · n new · d delete · D toggle default ".fg(DIM)]);

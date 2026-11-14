@@ -28,18 +28,18 @@ function h(tag, props, ...kids) {
 
 function clear(el) { el.replaceChildren(); return el; }
 
-/** An empty state: the logo, a lead line, then whatever explains it. */
-const emptyState = (lead, ...rest) => h('div', { class: 'empty' }, h('img', { class: 'ghost', src: 'logo.png', alt: '' }), lead && h('div', { class: 'lead', text: lead }), ...rest);
+/** An empty state: a lead line, then whatever explains it. */
+const emptyState = (lead, ...rest) => h('div', { class: 'empty' }, lead && h('div', { class: 'lead', text: lead }), ...rest);
 
-// ---------------------------------------------------------------- theme: follow the system, or pin dark or light
+// ---------------------------------------------------------------- theme: dark by default; light, or follow the system, on request
 
-const THEMES = ['auto', 'dark', 'light'];
-let theme = 'auto';
-try { theme = localStorage.getItem('elpis.theme') || 'auto'; } catch {}
+const THEMES = ['dark', 'light', 'auto'];
+let theme = 'dark';
+try { const saved = localStorage.getItem('elpis.theme'); if (THEMES.includes(saved)) theme = saved; } catch {}
 function applyTheme(t) {
   if (t === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
   const b = $('theme');
-  b.textContent = { auto: '◐', dark: '☾', light: '☀' }[t];
+  b.textContent = { dark: '☾', light: '☀', auto: '◐' }[t];
   b.title = 'Theme: ' + (t === 'auto' ? 'follows your system' : t) + ' (click to change)';
 }
 applyTheme(theme);

@@ -170,7 +170,7 @@ The **Capsules** tab (`7`) lists the Capsules in your store with who vouches for
 elpis-gui.exe
 ```
 
-A desktop window listing boxes with Start/Stop, a live log per box, and buttons that open terminals (including the box's own agent). It lives in the system tray, and follows your system's light or dark setting (the ◐ button pins one). Its **Capsules** tab covers the Capsule workflow: browse with trust badges, verify, run after a grant dialog, search, pull, push, fork, build, sign and remove; **Trust & keys** manages your signing policy and keys. See [its README](../crates/elpis-gui/README.md).
+A desktop window listing boxes with Start/Stop, a live log per box, and buttons that open terminals (including the box's own agent). It lives in the system tray, and is dark by default (the ☾ button switches to light, or to following your system). Its **Capsules** tab covers the Capsule workflow: browse with trust badges, verify, run after a grant dialog, search, pull, push, fork, build, sign and remove; **Trust & keys** manages your signing policy and keys. See [its README](../crates/elpis-gui/README.md).
 
 ## Low-level CLI
 

@@ -15,7 +15,7 @@ A desktop GUI for the [elpis](../elpis) engine — start elpis VMs, watch their 
 
 ## Look and feel
 
-The identity comes from the icon (an amphora in a hexagon, cut from olive paper): olive surfaces, sand text and highlights, and one terracotta accent for the action that matters, with hexagons for status marks and headings. There is a dark theme and a light "sand paper" one; the page follows your system's setting, and the ◐ button beside the name pins dark or light (remembered). All colours are variables at the top of `ui/index.html`. The icon master is `assets/elpis-icon.png`; `python scripts/make-icons.py` (needs Pillow) regenerates every size, `crates/elpis-gui/icons/*` and `ui/logo.png`. The TUI uses the same colours.
+A plain dark UI: neutral greys, thin borders, flat surfaces, system fonts. Green is the only accent and is used sparingly: the primary action, the active tab and selection, focus, a running box and "good" status (amber and red mean caution and failure). Dark is the default; the ☾ button beside the name cycles dark, light and "follow my system" (remembered). All colours are variables at the top of `ui/index.html`. The app icon (`assets/elpis-icon.png`, an amphora in a hexagon) is the project's identity; `python scripts/make-icons.py` (needs Pillow) regenerates every size, `crates/elpis-gui/icons/*` and `ui/logo.png`. The TUI uses the same greys and green.
 
 ## Capsules
 
