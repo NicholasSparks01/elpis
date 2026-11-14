@@ -2,8 +2,11 @@
 //!
 //! Each VM runs in its own async task that owns a [`elpis::Session`]; the UI talks to those tasks
 //! through Tauri commands and sees their log lines and state changes as Tauri events. Interactive
-//! terminals open in Windows Terminal running `elpis-run attach` against the VM's shim pipe.
+//! terminals open in Windows Terminal running `elpis-run attach` against the VM's shim pipe. The Capsules view
+//! (`capsules.rs`) is the same engine's Capsule workflow: browse, verify, run, pull, push, search, fork, sign, trust.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod capsules;
 
 use elpis::session::{debug_root, default_shim};
 use elpis::{Config, Log, Session};
@@ -39,6 +42,8 @@ struct VmInfo {
     namespace: String,
     path: String,
     running: bool,
+    /// What the box was made from ("kit opencode", "capsule team/tool@1.0.0", …), if it says
+    source: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -82,6 +87,7 @@ async fn list_vms(state: State<'_, AppState>) -> Result<Vec<VmInfo>, String> {
             work: work.to_string_lossy().into_owned(),
             path: work.to_string_lossy().into_owned(),
             namespace: id.clone(),
+            source: elpis::boxfile::BoxFile::load(&work).map(|b| b.source),
             id,
         })
         .collect())
@@ -161,6 +167,14 @@ async fn stop_vm(state: State<'_, AppState>, id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// The shell command that opens a running box's agent (a kit's entrypoint, or a Capsule's).
+#[tauri::command]
+async fn agent_command(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    let vms = state.vms.lock().await;
+    let vm = vms.get(&id).ok_or("VM is not running")?;
+    elpis::workdir::agent_command(&vm.work).ok_or_else(|| "this box has no agent command: it wasn't made from a kit or a Capsule".to_owned())
+}
+
 /// Open an interactive terminal into the VM via Windows Terminal running `elpis-run attach`.
 #[tauri::command]
 async fn open_terminal(state: State<'_, AppState>, id: String, command: String) -> Result<(), String> {
@@ -228,7 +242,35 @@ fn main() {
                 .build(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_vms, shim_info, start_vm, stop_vm, open_terminal])
+        .invoke_handler(tauri::generate_handler![
+            list_vms,
+            shim_info,
+            start_vm,
+            stop_vm,
+            open_terminal,
+            agent_command,
+            capsules::capsule_list,
+            capsules::capsule_verify_all,
+            capsules::capsule_detail,
+            capsules::capsule_remove,
+            capsules::capsule_build,
+            capsules::capsule_prepare_run,
+            capsules::capsule_run,
+            capsules::capsule_search,
+            capsules::capsule_inspect_remote,
+            capsules::capsule_pull,
+            capsules::capsule_push,
+            capsules::capsule_fork,
+            capsules::capsule_default_fork_dir,
+            capsules::capsule_default_registry,
+            capsules::capsule_keys,
+            capsules::capsule_keygen,
+            capsules::capsule_sign,
+            capsules::capsule_trust,
+            capsules::capsule_trust_add,
+            capsules::capsule_trust_remove,
+            capsules::capsule_trust_require,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running elpis-gui");
 }

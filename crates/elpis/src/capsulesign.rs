@@ -317,6 +317,44 @@ pub struct Report {
     pub provenance: Option<Provenance>,
 }
 
+/// How much to rely on something, for coloring a badge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    Good,
+    Warn,
+    Bad,
+    Dim,
+}
+
+impl Level {
+    pub fn name(self) -> &'static str {
+        match self {
+            Level::Good => "good",
+            Level::Warn => "warn",
+            Level::Bad => "bad",
+            Level::Dim => "dim",
+        }
+    }
+}
+
+/// The short trust badge for a Capsule in a list: what to show and how loudly. `None` is "not checked yet".
+pub fn badge(report: Option<&Report>) -> (String, Level) {
+    let Some(r) = report else { return ("checking…".to_owned(), Level::Dim) };
+    if !r.intact() {
+        return ("✗ modified".to_owned(), Level::Bad);
+    }
+    let trusted = r.trusted_signers();
+    if !trusted.is_empty() {
+        return (format!("✓ {}", crate::capsule::display_safe(&trusted.join(", "))), Level::Good);
+    }
+    let valid = r.signatures.iter().filter(|s| !matches!(s.standing, Standing::Invalid(_))).count();
+    match (r.signatures.len(), valid) {
+        (0, _) => ("unsigned".to_owned(), Level::Dim),
+        (_, 0) => ("✗ bad signature".to_owned(), Level::Bad),
+        _ => ("signed, untrusted".to_owned(), Level::Warn),
+    }
+}
+
 impl Trust {
     /// Whether a Capsule may be run under this policy. Fails when its files no longer match the build, or when
     /// the policy requires a signature from a trusted key, there is none, and `allow_unsigned` isn't set.

@@ -1925,20 +1925,14 @@ impl App {
 
 /// The Trust column for a Capsule: short, and coloured by how much to rely on it.
 fn trust_cell(report: Option<&Report>) -> (String, Color) {
-    let Some(r) = report else { return ("checking…".to_owned(), DIM) };
-    if !r.intact() {
-        return ("✗ modified".to_owned(), BAD);
-    }
-    let trusted = r.trusted_signers();
-    if !trusted.is_empty() {
-        return (format!("✓ {}", display_safe(&trusted.join(", "))), GOOD);
-    }
-    let valid = r.signatures.iter().filter(|s| !matches!(s.standing, Standing::Invalid(_))).count();
-    match (r.signatures.len(), valid) {
-        (0, _) => ("unsigned".to_owned(), DIM),
-        (_, 0) => ("✗ bad signature".to_owned(), BAD),
-        _ => ("signed, untrusted".to_owned(), WARN),
-    }
+    use elpis::capsulesign::Level;
+    let (text, level) = elpis::capsulesign::badge(report);
+    (text, match level {
+        Level::Good => GOOD,
+        Level::Warn => WARN,
+        Level::Bad => BAD,
+        Level::Dim => DIM,
+    })
 }
 
 fn verdict_color(report: Option<&Report>) -> Color {

@@ -7,7 +7,7 @@ Run coding agents in microVM sandboxes on Windows. Each agent gets its own light
 | [`elpis`](crates/elpis) | The engine, a library: drives a containerd shim (`Session`, `Execs`), provides the network stack (`netstack`), the egress policy (`policy`), the credential proxy (`credproxy`, `secrets`), kits (`kits`), image pulls (`registry`), boxes and templates (`workdir`, `boxfile`) |
 | [`elpis-run`](crates/elpis-run) | The CLI: `run AGENT`, `kits`, `pull`, `images`, `ls`, `create`, `rm`, `template`, `policy`, `secret`, `exec`, `attach`, or plain `elpis-run` to boot a work folder |
 | [`elpis-tui`](crates/elpis-tui) | The terminal dashboard: boxes with CPU/RAM, network activity with block/allow, network and filesystem rules, the agent catalog, Capsules with their signatures and requests, templates |
-| [`elpis-gui`](crates/elpis-gui) | A desktop GUI (Tauri 2): start VMs, watch logs, open terminals |
+| [`elpis-gui`](crates/elpis-gui) | A desktop GUI (Tauri 2): start VMs, watch logs, open terminals; run, verify, share and sign Capsules |
 | [`elpis-shim`](crates/elpis-shim) | The containerd shim: the VM on **libkrun over WHP**, built on [containerd/nerdbox](https://github.com/containerd/nerdbox)'s guest protocol |
 | [`guest/`](guest) | The VM guest, built with Docker: the kernel, and a rootfs with `vminitd`, `crun` and the `mkfs` tools VM |
 

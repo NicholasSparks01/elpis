@@ -30,7 +30,7 @@ cargo clippy --release --locked
 | `crates/elpis/src/ttrpc.rs`, `pb.rs`, `events.rs`, `exec.rs`, `stdio.rs` | ttrpc client, protobuf, event socket, exec/TTY, stdio pipes |
 | `crates/elpis/src/capsule*.rs`, `b64.rs` | Capsules: manifest and validation (`capsule.rs`), local store, fork (`capsulestore.rs`), Ed25519 signing, trust and `verify` (`capsulesign.rs`), push/pull/search over OCI (`capsuleremote.rs`), making a box from one (`capsulerun.rs`); design in `docs/capsule-manifest.md` |
 | `crates/elpis-run` | CLI (clap); `attach` is used by the TUI/GUI for terminals |
-| `crates/elpis-tui`, `crates/elpis-gui` | ratatui dashboard; Tauri 2 GUI (`ui/index.html`) |
+| `crates/elpis-tui`, `crates/elpis-gui` | ratatui dashboard; Tauri 2 GUI (`ui/index.html`, `ui/app.js`; Capsule commands in `src/capsules.rs`) |
 | `crates/elpis-shim/src` | containerd shim v2 with libkrun linked in: `setup.rs` (bundle → devices), `vm.rs`, `streams.rs`, `gpt.rs`, `mkfs.rs` (tools VM) |
 | `guest/` | Dockerfile for kernel + erofs rootfs (vminitd, crun, `elpis-mkfs`); `vminitd/clock` plugin |
 | `patches/libkrun/` | Numbered patches on the pinned libkrun commit |
