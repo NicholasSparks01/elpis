@@ -23,7 +23,8 @@ Elpis exists to let coding agents run with broad freedom inside a box while limi
 
 ## Things to know
 
-- **The default network policy is `allow`.** New boxes can reach the internet, your LAN, and every service listening on Windows `127.0.0.1` (through `host.docker.internal`). For untrusted work, set the default to `deny` or `ask` and deny `host.docker.internal` and `172.17.0.0`. See [hardening](networking.md#recommended-hardening).
+- **The default network policy is `allow`.** New boxes can reach the internet and your LAN. For untrusted work, set the default to `deny` or `ask`. See [hardening](networking.md#recommended-hardening).
+- **Host services are opt-in.** Services on Windows `127.0.0.1` are reachable only through a rule that names the host (`host.docker.internal[:PORT]`); allow single ports.
 - **Shared folders are the agent's to change.** A read-write workspace means the agent can modify or delete anything in it, including `.git` hooks and scripts that you later run on the host. Review changes before running them outside the box, or share read-only.
 - **Stored keys are usable from the box.** The box can't read a key, but it can make authenticated requests to the kit's listed domains with it.
 - **The proxy CA key is on disk.** `%USERPROFILE%\elpis\proxy\ca.key.pem` is trusted by every box for intercepted domains. Protect it like any credential.

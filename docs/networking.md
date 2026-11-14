@@ -14,7 +14,7 @@ container 172.17.0.1 ─ bridge in the VM ─ eth0 ─ virtio-net
 - **DNS:** the gateway (`172.17.0.0:53`) answers DNS. Queries go to the host's first resolver (`ELPIS_DNS` overrides, `1.1.1.1` if none is found). Answers label connections by host name, which is what name-based rules match.
 - **UDP:** other UDP is relayed only when the policy allows it.
 - **ICMP:** answered by the gateway itself (ping the gateway works; ping beyond it doesn't).
-- **The host:** `host.docker.internal` resolves to the gateway, and connections to the gateway go to Windows `127.0.0.1`. That's how an agent reaches a local model server such as Ollama.
+- **The host:** `host.docker.internal` resolves to the gateway, and connections to the gateway go to Windows `127.0.0.1`. This is **off unless you allow it** (see [Reaching the host](#reaching-the-host)).
 - **Published ports** go the other way; see [Usage](usage.md#published-ports).
 
 ## The policy
@@ -24,6 +24,8 @@ Each box has `network-policy.json` with a default action and a list of rules. De
 1. A matching **deny** rule blocks.
 2. Otherwise a matching **allow** rule (or a one-off grant) allows.
 3. Otherwise the **default** applies: `allow`, `deny` or `ask`.
+
+Host access is the exception: see [Reaching the host](#reaching-the-host).
 
 New boxes default to `allow`; a kit's domains are added as allow rules, so switching the default to `deny` leaves the agent working against its own services. Changes apply live: the file is reloaded when it changes, and future connections use it (open connections are not cut).
 
@@ -57,6 +59,20 @@ elpis-run.exe policy --work %USERPROFILE%\elpis\BOX allow "**.github.com"
 
 `deny PATTERN` and `rm ID` complete the set. In the TUI, the **Network rules** tab does the same (`n`, `d`, `D`), and the **Network activity** tab shows every host the box contacted with `b`/`w` to block or allow it.
 
+### Reaching the host
+
+Services on Windows `127.0.0.1` (a local model server, a database, your dev tools) are reachable only when a rule **names the host**: `host.docker.internal`, `gateway.docker.internal` or `172.17.0.0`, optionally with a port. Broad allows (`**`, CIDRs) and an `allow` default don't open it. With an `ask` default you're asked, as for any other host. Deny rules, including broad ones, still apply.
+
+To let a box reach Ollama:
+
+```bash
+elpis-run.exe policy --work %USERPROFILE%\elpis\BOX allow host.docker.internal:11434
+```
+
+Give the port: without one, the box can reach every service listening on the host's loopback.
+
+`--host-port PORT` is a separate, explicit forward of one port and isn't affected by the policy.
+
 ### Ask mode
 
 With the default set to `ask`, a TCP connection no rule covers is held: the stack doesn't answer the box's SYN, the guest retries, and meanwhile the host is listed as waiting. The TUI pops up a prompt (allow always, allow once, deny always, not now); from the CLI:
@@ -72,13 +88,7 @@ then answer with `policy … allow HOST` or `deny HOST`. The box's next retry go
 The default `allow` is convenient, not restrictive. For untrusted code:
 
 1. Set the default to `deny` (or `ask`) and allow only what the agent needs.
-2. **Deny the host** if the agent doesn't need your local services. The box reaches every service on Windows `127.0.0.1` through the gateway:
-   ```bash
-   elpis-run.exe policy --work %USERPROFILE%\elpis\BOX deny host.docker.internal
-   ```
-   ```bash
-   elpis-run.exe policy --work %USERPROFILE%\elpis\BOX deny 172.17.0.0
-   ```
+2. Keep host access off, or allow single ports (`host.docker.internal:11434`) rather than the whole host.
 3. **Deny your LAN** if you keep `allow`: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`.
 4. Publish ports on loopback only (the default).
 

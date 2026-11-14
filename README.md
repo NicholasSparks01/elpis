@@ -195,7 +195,7 @@ elpis-run.exe --net --shim-log warn --exec "curl -sI https://example.com" --then
 ```bash
 elpis-run.exe --net --shim-log warn --tty "cd /e/Project && opencode"
 ```
-OpenCode inside the VM, reaching Windows Ollama at `host.docker.internal:11434`.
+OpenCode inside the VM, reaching Windows Ollama at `host.docker.internal:11434` (allow it first with `policy … allow host.docker.internal:11434`; host access is opt-in).
 
 ```bash
 elpis-run.exe policy --work %USERPROFILE%\elpis\standalone deny "*.example.com"
@@ -229,7 +229,7 @@ container 172.17.0.1 → bridge in the VM → eth0 → Sailor → <work>\net.soc
   → smoltcp (any_ip) → policy check → Windows TcpStream / UdpSocket → the internet
 ```
 
-- TCP to 172.17.0.0 goes to Windows 127.0.0.1, which is how `host.docker.internal` (answered locally by the stack's DNS) works.
+- TCP to 172.17.0.0 goes to Windows 127.0.0.1, which is how `host.docker.internal` (answered locally by the stack's DNS) works. It's opt-in: only a rule naming the host allows it.
 - DNS is forwarded to the host's resolver (`ELPIS_DNS` overrides it), and replies are used to label flows by hostname.
 - Policy: deny beats allow, then the default. Patterns are `example.com`, `*.example.com`, `**`, IPs, IPv4 CIDRs, optionally with `:port`. The file is reloaded when it changes, and blocked TCP connections are reset immediately.
 - The spec needs three different MACs: the NIC's (`network.mac` = `ctr.network.vmmac`), the container's (`ctr.network.mac`), and the gateway's.

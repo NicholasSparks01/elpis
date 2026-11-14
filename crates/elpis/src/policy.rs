@@ -5,6 +5,10 @@
 //!
 //! The default can also be `ask` (sbx's approval prompts): a connection no rule covers waits for an answer.
 //! "Allow once" answers are kept in memory only, for as long as the VM runs.
+//!
+//! The Windows host (the gateway address, `host.docker.internal`) is opt-in: only a rule or grant that names
+//! it allows it. `**`, CIDRs and an `allow` default don't, so a box can't reach services on the host's
+//! loopback unless someone allowed exactly that.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -96,15 +100,24 @@ impl Policy {
     pub fn decide(&self, name: Option<&str>, ip: IpAddr, port: u16) -> Decision {
         self.refresh();
         let state = self.state.read().unwrap();
-        let matching = |action| state.0.rules.iter().find(|r| r.action == action && matches(&r.pattern, name, ip, port));
+        let host = ip == HOST_IP;
+        // Rules about the host match it however the box addressed it (by name, either alias, or IP)
+        let name = if host { Some(name.unwrap_or(HOST_NAMES[0])) } else { name };
+        let hits = |pattern: &str| matches(pattern, name, ip, port) || (host && matches(pattern, Some(HOST_NAMES[0]), ip, port));
+        // Any deny covers the host, but only an allow that names it opens it
+        let applies = |pattern: &str, action| hits(pattern) && (action == Action::Deny || !host || names_host(pattern));
+        let matching = |action| state.0.rules.iter().find(|r| r.action == action && applies(&r.pattern, action));
         if let Some(r) = matching(Action::Deny) {
             return Decision { action: Action::Deny, rule: Some(r.pattern.clone()) };
         }
         if let Some(r) = matching(Action::Allow) {
             return Decision { action: Action::Allow, rule: Some(r.pattern.clone()) };
         }
-        if let Some(g) = self.grants.lock().unwrap().iter().find(|g| matches(g, name, ip, port)) {
+        if let Some(g) = self.grants.lock().unwrap().iter().find(|g| applies(g, Action::Allow)) {
             return Decision { action: Action::Allow, rule: Some(format!("{g} (once)")) };
+        }
+        if host && state.0.default != Action::Ask {
+            return Decision { action: Action::Deny, rule: Some("host access is opt-in".into()) };
         }
         Decision { action: state.0.default, rule: None }
     }
@@ -186,6 +199,17 @@ fn validate(pattern: &str) -> Result<()> {
     Ok(())
 }
 
+/// The gateway address, which the network stack maps to the Windows host's loopback.
+const HOST_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(172, 17, 0, 0));
+/// Names the box's DNS answers with [`HOST_IP`].
+const HOST_NAMES: [&str; 2] = ["host.docker.internal", "gateway.docker.internal"];
+
+/// Whether a pattern names the host itself (optionally with a port), as opposed to covering it by accident.
+fn names_host(pattern: &str) -> bool {
+    let host = split_port(pattern).0.to_lowercase();
+    HOST_NAMES.contains(&host.as_str()) || host.parse::<IpAddr>() == Ok(HOST_IP)
+}
+
 fn matches(pattern: &str, name: Option<&str>, ip: IpAddr, port: u16) -> bool {
     let (host, want_port) = split_port(pattern);
     if want_port.is_some_and(|p| p != port) {
@@ -250,6 +274,37 @@ mod tests {
         p.add("a.example", Action::Deny).unwrap(); // a saved deny beats a grant
         assert_eq!(p.decide(Some("a.example"), ip, 443).action, Action::Deny);
         assert_eq!(Policy::load(&dir).snapshot().default, Action::Ask); // grants aren't saved, the default is
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_is_opt_in() {
+        let dir = std::env::temp_dir().join(format!("elpis-policy-host-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = Policy::load(&dir);
+        let gw: IpAddr = "172.17.0.0".parse().unwrap();
+        let other: IpAddr = "1.2.3.4".parse().unwrap();
+        // Default allow: the internet is open, the host isn't
+        assert_eq!(p.decide(None, other, 443).action, Action::Allow);
+        assert_eq!(p.decide(Some("host.docker.internal"), gw, 11434).action, Action::Deny);
+        assert_eq!(p.decide(None, gw, 11434).action, Action::Deny);
+        // Broad rules don't open it
+        p.add("**", Action::Allow).unwrap();
+        p.add("172.16.0.0/12", Action::Allow).unwrap();
+        assert_eq!(p.decide(None, gw, 11434).action, Action::Deny);
+        // A rule naming it does, by either name or the IP, and a port limits it
+        p.add("host.docker.internal:11434", Action::Allow).unwrap();
+        assert_eq!(p.decide(None, gw, 11434).action, Action::Allow);
+        assert_eq!(p.decide(Some("gateway.docker.internal"), gw, 11434).action, Action::Allow);
+        assert_eq!(p.decide(None, gw, 22).action, Action::Deny);
+        // Ask still asks
+        p.set_default(Action::Ask).unwrap();
+        assert_eq!(p.decide(None, gw, 22).action, Action::Ask);
+        p.grant_once("172.17.0.0:22").unwrap();
+        assert_eq!(p.decide(None, gw, 22).action, Action::Allow);
+        // A broad deny still covers it
+        p.add("172.16.0.0/12", Action::Deny).unwrap();
+        assert_eq!(p.decide(None, gw, 11434).action, Action::Deny);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

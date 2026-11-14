@@ -64,7 +64,7 @@ Edit `bundle\config.json` and `rootfs.json` only while the box is stopped.
   "default": "deny",
   "rules": [
     { "id": 1, "pattern": "**.anthropic.com", "action": "allow", "created": "2026-11-13T10:00:00Z" },
-    { "id": 2, "pattern": "host.docker.internal", "action": "deny", "created": "2026-11-13T10:00:00Z" }
+    { "id": 2, "pattern": "host.docker.internal:11434", "action": "allow", "created": "2026-11-13T10:00:00Z" }
   ]
 }
 ```

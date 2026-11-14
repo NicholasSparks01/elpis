@@ -340,7 +340,6 @@ fn fill_from_image(work: &Path, new: &NewBox, image: &Image, kit: Option<&Kit>) 
         for pattern in &kit.permissions.network.allow {
             let _ = policy.add(pattern, Action::Allow);
         }
-        let _ = policy.add("host.docker.internal", Action::Allow);
     }
     Ok(())
 }

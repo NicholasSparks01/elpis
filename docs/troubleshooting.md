@@ -41,7 +41,7 @@
 
 **Connections hang.** With the default set to `ask`, connections no rule covers wait for an answer: check the TUI prompt or `elpis-run approvals BOX`.
 
-**`host.docker.internal` doesn't connect.** The service must listen on Windows `127.0.0.1` (or all interfaces), and no deny rule may cover `host.docker.internal` or `172.17.0.0`.
+**`host.docker.internal` doesn't connect.** Host access is opt-in: add `policy … allow host.docker.internal:PORT` (the log shows `host access is opt-in` when this is why). The service must also listen on Windows `127.0.0.1` or all interfaces.
 
 **A published port doesn't answer.** The server in the box must listen on `0.0.0.0` (or the container's address), not only `127.0.0.1` inside the box.
 
