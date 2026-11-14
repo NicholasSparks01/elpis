@@ -271,6 +271,109 @@ pub fn pull_from(registry: &Registry, store: &Store, force: bool, progress: &dyn
     Ok(built)
 }
 
+/// A Capsule release found in a registry. Everything but `reference` and `version` is what the registry's
+/// manifest annotations claim: display text, not something to trust.
+#[derive(Clone, Debug)]
+pub struct Found {
+    /// `registry/repository:version`: what `capsule pull` takes
+    pub reference: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    /// The Capsule digest the manifest claims (empty if it doesn't say)
+    pub digest: String,
+    /// A signature set exists in the registry for that digest. Says nothing about who signed it or whether you trust them.
+    pub signatures_published: bool,
+}
+
+/// Repositories read from a catalog, and repositories whose manifests are fetched, at most.
+const MAX_REPOSITORIES: usize = 2000;
+const MAX_EXAMINED: usize = 300;
+const VERSIONS_SHOWN: usize = 10;
+const MAX_DESCRIPTION_CHARS: usize = 300;
+
+/// The Capsule name a repository holds: its last two path components (`team/myteam/tool` → `myteam/tool`).
+fn capsule_name_of(repository: &str) -> Option<String> {
+    let parts: Vec<&str> = repository.split('/').collect();
+    let name = format!("{}/{}", parts.get(parts.len().checked_sub(2)?)?, parts.last()?);
+    crate::capsule::validate_capsule_name(&name).ok().map(|_| name)
+}
+
+/// Search a registry (`REGISTRY` or `REGISTRY/PREFIX`) for Capsules whose name or description contains every word
+/// of `query` (all of them, when it is empty). Reads the registry's catalog, then only each Capsule's manifest, never
+/// a payload. Needs a registry that lists its repositories; the newest version of each is shown unless `all_versions`.
+pub fn search(registry_and_prefix: &str, query: &str, all_versions: bool, progress: &dyn Fn(&str)) -> Result<Vec<Found>> {
+    let dest = registry_and_prefix.trim().trim_end_matches('/');
+    if dest.is_empty() || dest.contains("://") || dest.contains('@') {
+        bail!("{dest:?} should be a registry like registry.example.com, optionally with a path (registry.example.com/team)");
+    }
+    let (host, prefix) = dest.split_once('/').unwrap_or((dest, ""));
+    search_in(&Registry::for_host(host), prefix, query, all_versions, progress)
+}
+
+pub fn search_in(registry: &Registry, prefix: &str, query: &str, all_versions: bool, progress: &dyn Fn(&str)) -> Result<Vec<Found>> {
+    let host = registry.reference.registry.clone();
+    let listed = registry.catalog(MAX_REPOSITORIES).map_err(|e| match e.downcast_ref::<crate::registry::HttpStatus>() {
+        Some(s) if matches!(s.code, 404 | 405 | 501) => anyhow::anyhow!(
+            "{host} doesn't list its repositories (GET /v2/_catalog gave HTTP {}), so it can't be searched; if you know a Capsule's repository, `capsule inspect --remote {host}/NAMESPACE/NAME:VERSION` reads it directly",
+            s.code
+        ),
+        _ => e,
+    })?;
+    let prefix = prefix.trim_matches('/');
+    let mut repos: Vec<String> = listed.into_iter().filter(|r| prefix.is_empty() || r == prefix || r.starts_with(&format!("{prefix}/"))).filter(|r| capsule_name_of(r).is_some()).collect();
+    repos.sort();
+    if repos.len() > MAX_EXAMINED {
+        progress(&format!("{} repositories match the prefix; searching the first {MAX_EXAMINED} (add a path to narrow it)", repos.len()));
+        repos.truncate(MAX_EXAMINED);
+    }
+
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut found = Vec::new();
+    for repo in repos {
+        let Some(name) = capsule_name_of(&repo) else { continue };
+        let tags = match registry.tags(&repo) {
+            Ok(t) => t,
+            Err(e) => {
+                progress(&format!("skipping {repo}: {e:#}"));
+                continue;
+            }
+        };
+        let mut versions: Vec<(String, (u64, u64, u64))> = tags.iter().filter_map(|t| Some((t.clone(), crate::capsule::parse_version(t).ok()?))).collect();
+        versions.sort_by_key(|v| v.1);
+        let keep = if all_versions { VERSIONS_SHOWN } else { 1 };
+        for (tag, _) in versions.iter().rev().take(keep) {
+            let client = registry.sibling(&repo, tag);
+            let Ok(Some((body, _))) = client.manifest_bytes(tag, MANIFEST_MEDIA) else { continue };
+            let Ok(manifest) = serde_json::from_slice::<Value>(&body) else { continue };
+            if manifest["artifactType"] != ARTIFACT_TYPE {
+                continue;
+            }
+            let annotation = |k: &str| manifest["annotations"][k].as_str().unwrap_or_default();
+            // a manifest that claims another version than its tag is mislabeled; it can't be pulled anyway
+            if annotation("org.opencontainers.image.version") != tag {
+                continue;
+            }
+            let description: String = annotation("org.opencontainers.image.description").chars().take(MAX_DESCRIPTION_CHARS).collect();
+            let haystack = format!("{name} {description}").to_lowercase();
+            if !words.iter().all(|w| haystack.contains(w.as_str())) {
+                continue;
+            }
+            let digest = annotation(ANNOTATION_DIGEST).to_owned();
+            found.push(Found {
+                reference: format!("{host}/{repo}:{tag}"),
+                name: name.clone(),
+                version: tag.clone(),
+                description,
+                signatures_published: !digest.is_empty() && tags.contains(&signatures_tag(&digest)),
+                digest,
+            });
+        }
+    }
+    found.sort_by(|a, b| (&a.name, crate::capsule::parse_version(&a.version).unwrap_or_default()).cmp(&(&b.name, crate::capsule::parse_version(&b.version).unwrap_or_default())));
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +403,10 @@ mod tests {
         manifests: HashMap<String, Vec<u8>>,
         /// Serve these bytes instead of the blob with this digest
         corrupt: Option<String>,
+        /// Answer GET /v2/_catalog with 404, as registries that don't list their repositories do
+        no_catalog: bool,
+        /// Repositories per catalog or tag-list page (0: everything in one)
+        page_size: usize,
     }
 
     struct Mock {
@@ -384,6 +491,32 @@ mod tests {
 
         let rest = path.strip_prefix("/v2/").unwrap_or_default();
         let mut state = state.lock().unwrap();
+        // listings: the catalog and each repository's tags, paged with Link headers like a real registry
+        let listing = if rest == "_catalog" {
+            if state.no_catalog {
+                return respond(&mut stream, "404 Not Found", &[], b"{}", 2, true);
+            }
+            let mut repos: Vec<String> = state.manifests.keys().filter_map(|k| k.split_once(':').map(|(r, _)| r.to_owned())).collect();
+            Some(("repositories", repos.drain(..).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>(), "/v2/_catalog".to_owned()))
+        } else if let Some(repo) = rest.strip_suffix("/tags/list") {
+            let tags: std::collections::BTreeSet<String> =
+                state.manifests.keys().filter_map(|k| k.strip_prefix(&format!("{repo}:"))).filter(|r| !r.starts_with("sha256:")).map(str::to_owned).collect();
+            Some(("tags", tags.into_iter().collect(), format!("/v2/{repo}/tags/list")))
+        } else {
+            None
+        };
+        if let Some((key, items, base)) = listing {
+            let last = query.split('&').find_map(|p| p.strip_prefix("last=")).unwrap_or_default();
+            let after: Vec<&String> = items.iter().filter(|i| last.is_empty() || i.as_str() > last).collect();
+            let page = if state.page_size == 0 { after.len() } else { state.page_size.min(after.len()) };
+            let shown: Vec<&String> = after[..page].to_vec();
+            let mut headers = Vec::new();
+            if page < after.len() {
+                headers.push(("Link", format!("<{base}?last={}&n={}>; rel=\"next\"", shown.last().unwrap(), state.page_size)));
+            }
+            let body = serde_json::to_vec(&json!({ key: shown })).unwrap();
+            return respond(&mut stream, "200 OK", &headers, &body, body.len(), true);
+        }
         if let Some((repo, _)) = rest.split_once("/blobs/uploads/") {
             if method == "POST" {
                 return respond(&mut stream, "202 Accepted", &[("Location", format!("/v2/{repo}/blobs/uploads/u1"))], b"", 0, false);
@@ -699,6 +832,121 @@ mod tests {
         let notes = std::cell::RefCell::new(Vec::new());
         pull_from(&r, &Store::at(temp("sig-wrong-b")), false, &|l: &str| notes.borrow_mut().push(l.to_owned())).unwrap();
         assert!(notes.borrow().iter().any(|l| l.contains("couldn't read signatures")));
+    }
+
+    // ------------------------------------------------------------ search
+
+    /// Push `myteam/<name>` at `version` with a description to a mock registry under `prefix`.
+    fn publish(m: &Mock, prefix: &str, name: &str, version: &str, description: &str, sign_with: Option<&[u8]>) {
+        let src = temp(&format!("pub-{name}-{version}-src"));
+        write(
+            &src.join("capsule.yaml"),
+            &format!("apiVersion: elpis.dev/v1alpha1\nkind: Capsule\nmetadata: {{ name: myteam/{name}, version: {version}, description: \"{description}\" }}\nspec:\n  runtime: {{ image: {DIGEST}, entrypoint: [run] }}\n"),
+        );
+        let store = Store::at(temp(&format!("pub-{name}-{version}-store")));
+        let built = store.build(&src, false).unwrap();
+        if let Some(key) = sign_with {
+            store.add_signature(&built, &crate::capsulesign::sign(key, &built).unwrap()).unwrap();
+        }
+        let r = client(m, &format!("{prefix}myteam/{name}:{version}"), None);
+        push_to(&r, &store, &built, false, &quiet).unwrap();
+    }
+
+    fn find(m: &Mock, prefix: &str, query: &str, all: bool) -> Result<Vec<Found>> {
+        search_in(&Registry::with_login(Reference::parse(&format!("{}/x", m.addr)).unwrap(), None), prefix, query, all, &quiet)
+    }
+
+    fn names(found: &[Found]) -> Vec<String> {
+        found.iter().map(|f| format!("{}@{}", f.name, f.version)).collect()
+    }
+
+    #[test]
+    fn search_matches_names_and_descriptions_and_shows_the_newest_version() {
+        let m = mock(Auth::Open);
+        publish(&m, "team/", "code-reviewer", "1.0.0", "Reviews a diff and writes comments", None);
+        publish(&m, "team/", "code-reviewer", "1.10.0", "Reviews a diff, faster", None);
+        publish(&m, "team/", "code-reviewer", "1.9.0", "older", None);
+        publish(&m, "team/", "release-notes", "0.3.0", "Drafts release notes from commits", None);
+        publish(&m, "team/", "triage", "2.0.0", "Sorts incoming issues", None);
+
+        // by description, case-insensitively, newest by version number (1.10.0 beats 1.9.0)
+        assert_eq!(names(&find(&m, "team", "REVIEWS diff", false).unwrap()), ["myteam/code-reviewer@1.10.0"]);
+        // by name
+        assert_eq!(names(&find(&m, "team", "notes", false).unwrap()), ["myteam/release-notes@0.3.0"]);
+        // every word has to match somewhere
+        assert!(find(&m, "team", "reviews banana", false).unwrap().is_empty());
+        // no query: everything, one version each
+        assert_eq!(names(&find(&m, "team", "", false).unwrap()), ["myteam/code-reviewer@1.10.0", "myteam/release-notes@0.3.0", "myteam/triage@2.0.0"]);
+        // all versions, in version order
+        assert_eq!(names(&find(&m, "team", "code-reviewer", true).unwrap()), ["myteam/code-reviewer@1.0.0", "myteam/code-reviewer@1.9.0", "myteam/code-reviewer@1.10.0"]);
+        let f = &find(&m, "team", "triage", false).unwrap()[0];
+        assert!(f.reference.ends_with("/team/myteam/triage:2.0.0") && f.reference.starts_with(&m.addr));
+        assert_eq!(f.description, "Sorts incoming issues");
+    }
+
+    #[test]
+    fn search_stays_inside_the_prefix_and_skips_what_is_not_a_capsule() {
+        let m = mock(Auth::Open);
+        publish(&m, "team-a/", "alpha", "1.0.0", "in a", None);
+        publish(&m, "team-b/", "beta", "1.0.0", "in b", None);
+        // an ordinary image with a semver tag, and a tag that isn't a version
+        {
+            let mut s = m.state.lock().unwrap();
+            s.manifests.insert("team-a/myteam/notacapsule:1.0.0".into(), br#"{"schemaVersion":2,"config":{"mediaType":"x","digest":"sha256:x","size":1},"layers":[]}"#.to_vec());
+            s.manifests.insert("team-a/myteam/alpha:latest".into(), b"{}".to_vec());
+            s.manifests.insert("flat:1.0.0".into(), b"{}".to_vec());
+        }
+        assert_eq!(names(&find(&m, "team-a", "", false).unwrap()), ["myteam/alpha@1.0.0"]);
+        assert_eq!(names(&find(&m, "team-b", "", false).unwrap()), ["myteam/beta@1.0.0"]);
+        assert_eq!(names(&find(&m, "", "", false).unwrap()), ["myteam/alpha@1.0.0", "myteam/beta@1.0.0"], "no prefix searches the whole registry");
+        assert!(find(&m, "team", "", false).unwrap().is_empty(), "a prefix is a path, not a string prefix: team doesn't cover team-a");
+    }
+
+    #[test]
+    fn search_follows_pages_and_reports_published_signatures() {
+        let m = mock(Auth::Open);
+        let (key, _) = signer();
+        for (i, name) in ["one", "two", "three", "four", "five"].iter().enumerate() {
+            publish(&m, "", name, "1.0.0", "page test", if i == 1 { Some(&key) } else { None });
+        }
+        m.state.lock().unwrap().page_size = 2;
+        let found = find(&m, "", "page", false).unwrap();
+        assert_eq!(found.len(), 5, "all three catalog pages were read");
+        let signed: Vec<&str> = found.iter().filter(|f| f.signatures_published).map(|f| f.name.as_str()).collect();
+        assert_eq!(signed, ["myteam/two"]);
+    }
+
+    #[test]
+    fn a_registry_without_a_catalog_says_how_to_proceed() {
+        let m = mock(Auth::Open);
+        m.state.lock().unwrap().no_catalog = true;
+        let e = format!("{:#}", find(&m, "", "x", false).unwrap_err());
+        assert!(e.contains("doesn't list its repositories") && e.contains("inspect --remote"), "{e}");
+    }
+
+    #[test]
+    fn search_uses_the_stored_login_and_asks_for_one_when_missing() {
+        let m = mock(Auth::Basic("Basic dXNlcjpwYXNz".into()));
+        let r = |login| Registry::with_login(Reference::parse(&format!("{}/x", m.addr)).unwrap(), login);
+        let e = format!("{:#}", search_in(&r(None), "", "", false, &quiet).unwrap_err());
+        assert!(e.contains("secret set registry."), "{e}");
+        assert!(search_in(&r(Some(("user".into(), "pass".into()))), "", "", false, &quiet).unwrap().is_empty());
+    }
+
+    #[test]
+    fn long_descriptions_are_cut_and_mislabeled_manifests_are_skipped() {
+        let m = mock(Auth::Open);
+        publish(&m, "", "wordy", "1.0.0", &"x".repeat(1000), None);
+        publish(&m, "", "honest", "1.0.0", "fine", None);
+        // the manifest at tag 1.0.0 of `liar` claims to be version 9.9.9
+        {
+            let mut s = m.state.lock().unwrap();
+            let body = String::from_utf8(s.manifests["myteam/honest:1.0.0"].clone()).unwrap().replace("\"org.opencontainers.image.version\":\"1.0.0\"", "\"org.opencontainers.image.version\":\"9.9.9\"");
+            s.manifests.insert("myteam/liar:1.0.0".into(), body.into_bytes());
+        }
+        let found = find(&m, "", "", false).unwrap();
+        assert_eq!(names(&found), ["myteam/honest@1.0.0", "myteam/wordy@1.0.0"]);
+        assert_eq!(found[1].description.chars().count(), 300);
     }
 
     #[test]

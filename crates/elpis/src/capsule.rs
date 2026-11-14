@@ -46,6 +46,9 @@ pub struct Metadata {
     /// `namespace/name@version` of the Capsule this was forked from
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived_from: Option<String>,
+    /// The digest of that exact Capsule: lineage names content, since a registry tag can be republished
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -289,6 +292,14 @@ impl Capsule {
             validate_capsule_name(name).context("metadata.derivedFrom")?;
             parse_version(version).context("metadata.derivedFrom")?;
         }
+        if let Some(d) = &self.metadata.derived_digest {
+            if self.metadata.derived_from.is_none() {
+                bail!("metadata.derivedDigest needs metadata.derivedFrom");
+            }
+            if !d.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
+                bail!("metadata.derivedDigest {d:?} should be sha256:<64 lowercase hex digits>");
+            }
+        }
         if let Some(min) = self.spec.compatibility.elpis.as_deref() {
             parse_min_version(min).context("spec.compatibility.elpis")?;
         }
@@ -476,15 +487,15 @@ impl Capsule {
     pub fn summary(&self, digest: Option<&str>) -> String {
         let (rt, spec) = (&self.spec.runtime, &self.spec);
         let mut s = format!("{}\n", self.reference());
-        let mut line = |label: &str, text: String| s.push_str(&format!("  {label:<11}{text}\n"));
+        let mut line = |label: &str, text: String| s.push_str(&format!("  {label:<12}{text}\n"));
         if !self.metadata.description.is_empty() {
-            line("about", self.metadata.description.clone());
+            line("about", display_safe(&self.metadata.description));
         }
         if let Some(d) = digest {
             line("digest", d.to_owned());
         }
         if let Some(from) = &self.metadata.derived_from {
-            line("forked from", from.clone());
+            line("forked from", format!("{from}{}", self.metadata.derived_digest.as_deref().map_or(String::new(), |d| format!("  ({})", &d[..d.len().min(19)]))));
         }
         if let Some(g) = &self.metadata.source {
             line("source", format!("{} @ {}", g.git, g.commit));
@@ -660,6 +671,32 @@ impl Requests {
 
 fn list_or_none(ports: &BTreeSet<u16>) -> String {
     if ports.is_empty() { "none".to_owned() } else { ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ") }
+}
+
+/// Text from a manifest or a registry, made safe to print: control characters (terminal escape sequences) and
+/// the invisible direction overrides that can disguise text become `?`.
+pub fn display_safe(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') { '?' } else { c }).collect()
+}
+
+/// The manifest for a fork: `text` (the original `capsule.yaml`) renamed and set to `version`, with its lineage
+/// pointing at the original. The author-declared `source` is dropped (it described the original). The author's
+/// layout is kept, but YAML comments are not. The result is parsed and validated before it is returned.
+pub fn forked_manifest(text: &str, new_name: &str, version: &str, parent: &str, parent_digest: &str) -> Result<String> {
+    use serde_yaml::Value;
+    validate_capsule_name(new_name)?;
+    parse_version(version)?;
+    let mut doc: Value = serde_yaml::from_str(text).context("reading the original manifest")?;
+    let meta = doc.get_mut("metadata").and_then(Value::as_mapping_mut).context("the manifest has no metadata")?;
+    let key = |k: &str| Value::String(k.to_owned());
+    meta.insert(key("name"), key(new_name));
+    meta.insert(key("version"), key(version));
+    meta.insert(key("derivedFrom"), key(parent));
+    meta.insert(key("derivedDigest"), key(parent_digest));
+    meta.remove(key("source"));
+    let out = serde_yaml::to_string(&doc)?;
+    Capsule::parse(&out).context("the forked manifest")?;
+    Ok(out)
 }
 
 /// `namespace/name`: lowercase letters, digits and hyphens in each part (max 40).
@@ -1063,6 +1100,38 @@ spec:
         assert_eq!((back.capsule, back.granted, back.credentials_ignored), (lock.capsule, lock.granted, lock.credentials_ignored));
         std::fs::write(Lock::path_for(&dir), r#"{"capsule":"a/b@1.0.0","bogus":1}"#).unwrap();
         assert!(Lock::load(&dir).is_none());
+    }
+
+    #[test]
+    fn lineage_names_content_as_well_as_a_version() {
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let with = |extra: &str| manifest().replace("derivedFrom: myteam/base-reviewer@1.0.0", &format!("derivedFrom: myteam/base-reviewer@1.0.0\n  {extra}"));
+        assert!(Capsule::parse(&with(&format!("derivedDigest: {digest}"))).is_ok());
+        assert!(err(&with("derivedDigest: sha256:abc")).contains("derivedDigest"));
+        assert!(err(&with(&format!("derivedDigest: {}", digest.to_uppercase()))).contains("derivedDigest"));
+        let orphan = manifest().replace("  derivedFrom: myteam/base-reviewer@1.0.0\n", &format!("  derivedDigest: {digest}\n"));
+        assert!(err(&orphan).contains("needs metadata.derivedFrom"));
+        assert!(Capsule::parse(&with(&format!("derivedDigest: {digest}"))).unwrap().summary(None).contains("forked from myteam/base-reviewer@1.0.0  (sha256:abababababab)"));
+    }
+
+    #[test]
+    fn forked_manifests_are_validated_and_keep_the_authors_layout() {
+        let digest = format!("sha256:{}", "cd".repeat(32));
+        let out = forked_manifest(&manifest(), "otherteam/mine", "0.2.0", "myteam/code-reviewer@1.2.0", &digest).unwrap();
+        let fork = Capsule::parse(&out).unwrap();
+        assert_eq!((fork.metadata.name.as_str(), fork.metadata.version.as_str()), ("otherteam/mine", "0.2.0"));
+        assert_eq!(fork.metadata.derived_from.as_deref(), Some("myteam/code-reviewer@1.2.0"), "the old lineage is replaced by the new parent");
+        assert_eq!(fork.spec.requests.network.allow, ["api.anthropic.com", "*.npmjs.org"]);
+        assert!(forked_manifest(&manifest(), "Bad Name", "0.2.0", "a/b@1.0.0", &digest).is_err());
+        assert!(forked_manifest(&manifest(), "a/b", "1.0", "a/b@1.0.0", &digest).is_err());
+        assert!(forked_manifest("spec: {}", "a/b", "1.0.0", "a/b@1.0.0", &digest).is_err());
+        assert!(forked_manifest(&manifest(), "a/b", "1.0.0", "not a reference", &digest).is_err(), "a malformed parent is caught by validation");
+    }
+
+    #[test]
+    fn registry_text_is_made_safe_to_print() {
+        assert_eq!(display_safe("plain text, ünïcode ok"), "plain text, ünïcode ok");
+        assert_eq!(display_safe("a\u{1b}[31mred\u{202e}x\u{7}\n"), "a?[31mred?x??");
     }
 
     #[test]

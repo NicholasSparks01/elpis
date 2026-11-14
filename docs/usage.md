@@ -96,10 +96,12 @@ A template freezes a stopped box's writable layer as a read-only layer on top of
 
 ## Capsules (preview)
 
-A **Capsule** is a portable description of an agent: image, start command, files, and what it asks for (network, credentials). It is not a VM snapshot, so it carries no tokens or state. The manifest is described in [Capsule manifest](capsule-manifest.md). You can build, inspect, list, run, push, pull, sign and verify Capsules; a team catalog (search, fork) isn't implemented yet.
+A **Capsule** is a portable description of an agent: image, start command, files, and what it asks for (network, credentials). It is not a VM snapshot, so it carries no tokens or state. The manifest is described in [Capsule manifest](capsule-manifest.md). You can build, inspect, list, run, push, pull, sign, verify, search and fork Capsules.
 
 | Task | Command |
 |---|---|
+| Find Capsules | `capsule search WORDS…` (your store), `capsule search WORDS… --registry REGISTRY[/PREFIX]` (a registry; `--all-versions`, `--local`) |
+| Start your own from one | `capsule fork NAME[@VERSION] NEWNS/NEWNAME [--dir DIR] [--version V]` (or a registry reference, which is pulled first) |
 | Run it in a new box | `capsule run NAME[@VERSION] [DIR] [--yes] [-p HOST:BOX]` |
 | Upload to a registry | `capsule push NAME@VERSION REGISTRY[/PREFIX] [--force]` |
 | Download from a registry | `capsule pull REGISTRY/NAMESPACE/NAME:VERSION [--force]` (`@sha256:…` instead of `:VERSION` pins it) |
@@ -117,6 +119,12 @@ A **Capsule** is a portable description of an agent: image, start command, files
 `build` refuses a manifest whose image isn't pinned by digest, and a payload that holds an obvious secret, leads outside the folder, or contains a symbolic link. Payload folders skip `.git`. Files ending in `.sh` or starting with `#!` become executable in the box, since Windows has no executable bit to read; everything else is read-only (0644) and owned by root. The same files always produce the same digest. A built version is immutable: rebuilding it with changed content fails unless you pass `--force`, so bump `metadata.version` instead.
 
 `capsule run` verifies the stored Capsule, prints what it asks for and waits for a yes (`--yes` accepts everything it asks for), pulls its image, and makes a box named `CAPSULE-FOLDER` (or `--name`) whose network policy is default `deny` plus an allow rule for each granted host. It then opens the agent, as `run` does. If the box already exists from the same build it is reused; from a different build, or not from a Capsule, it stops and tells you. A Capsule with a workspace shares `DIR` (default: the current folder) at the path and access it declares; one without refuses a folder. `-p` publishes only ports the Capsule declares. `capsule.lock` in the box folder records what was requested and granted.
+
+### Finding and forking
+
+`capsule search code review` lists the Capsules in your store whose name or description contain every word. With `--registry registry.example.com/team` (or `ELPIS_CAPSULE_REGISTRY`, with `--local` to override it) it searches a registry instead: it reads the registry's catalog and then only each Capsule's manifest, never a payload, and shows the newest version of each unless you pass `--all-versions`. That needs a registry that lists its repositories (`GET /v2/_catalog`); Docker Hub and GitHub's registry don't, and `search` says so. If you know a Capsule's repository, `capsule inspect --remote REF` reads it directly. A path after the registry limits the search to that part of it (`registry.example.com/team` covers `team/…` but not `team-two/…`), and at most 300 repositories are examined. Names, descriptions and "signatures published" come from the registry and are unchecked, so they are shown with control characters replaced, and nothing is trusted until you pull, `capsule verify` and `capsule inspect` it.
+
+`capsule fork myteam/code-reviewer@1.2.0 otherteam/strict-reviewer` writes an editable folder: the manifest renamed to your name at version 0.1.0 (`--version` changes it) with `metadata.derivedFrom` and `metadata.derivedDigest` recording exactly what it came from, and the payload unpacked into the folders `payload[].from` names, so `capsule build` on the folder gives the same payload until you change it. Pass a registry reference (`registry.example.com/team/myteam/code-reviewer:1.2.0`) and it is pulled first. A fork is a new, unsigned Capsule: the original's signatures don't carry over, you sign your own, and the original's `metadata.source` is dropped. YAML comments aren't kept, and executable bits come back only for `.sh` files and `#!` scripts. Which Capsules were forked from yours isn't tracked: the lineage points from the fork back to its parent, and a registry has no index for the other direction.
 
 ### Signing and trust
 

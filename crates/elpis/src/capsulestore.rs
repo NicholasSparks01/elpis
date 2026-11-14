@@ -9,7 +9,7 @@
 //! skip `.git`, and are scanned for obvious secrets, so a build can't quietly pick up files from elsewhere
 //! on the machine or ship a credential. Stored Capsules are re-hashed on load.
 
-use crate::capsule::{Capsule, PayloadEntry, looks_like_secret, parse_version, validate_capsule_name};
+use crate::capsule::{Capsule, PayloadEntry, forked_manifest, looks_like_secret, parse_version, validate_capsule_name};
 use crate::capsulesign::{SignatureRecord, is_key_id};
 use crate::session::debug_root;
 use anyhow::{Context, Result, bail};
@@ -194,6 +194,49 @@ impl Store {
             path: PathBuf::new(),
         };
         self.install(built, manifest, payload, force)
+    }
+
+    /// Start a fork: write an editable Capsule folder at `dest` from a stored Capsule. The manifest is renamed to
+    /// `new_name` at `version` (default 0.1.0) with its lineage pointing at the original's name, version and
+    /// digest, and the payload is unpacked to the folders the manifest's `payload[].from` name, so `capsule
+    /// build` on the folder rebuilds it. `dest` must not exist or must be empty. The fork is a new, unsigned
+    /// Capsule: the original's signatures say nothing about it.
+    pub fn fork(&self, built: &Built, new_name: &str, version: Option<&str>, dest: &Path) -> Result<Forked> {
+        validate_capsule_name(new_name)?;
+        if new_name == built.name {
+            bail!("a fork needs a name of its own, but {new_name} is the original's; use another name or namespace (e.g. myteam/{})", built.name.rsplit('/').next().unwrap_or("tool"));
+        }
+        if dest.exists() && std::fs::read_dir(dest).with_context(|| format!("reading {}", dest.display()))?.next().is_some() {
+            bail!("{} isn't empty; give --dir a new or empty folder", dest.display());
+        }
+        let capsule = self.load(built)?;
+        let (manifest, payload) = self.files(built)?;
+        let manifest = forked_manifest(std::str::from_utf8(&manifest)?, new_name, version.unwrap_or("0.1.0"), &built.reference(), &built.digest)?;
+
+        let created = !dest.exists();
+        let write = || -> Result<u64> {
+            std::fs::create_dir_all(dest)?;
+            // an archive that came from a registry is re-checked before any of it touches this disk
+            let files = match &payload {
+                Some(gz) => {
+                    validate_payload_archive(&capsule, gz)?;
+                    extract_payload(&capsule, gz, dest)?
+                }
+                None => 0,
+            };
+            // last, so a payload that happens to hold its own capsule.yaml doesn't win
+            std::fs::write(dest.join(MANIFEST_FILE), manifest.as_bytes())?;
+            Ok(files)
+        };
+        match write() {
+            Ok(files) => Ok(Forked { dir: dest.to_owned(), files, name: new_name.to_owned(), version: version.unwrap_or("0.1.0").to_owned(), parent: built.reference() }),
+            Err(e) => {
+                if created {
+                    let _ = std::fs::remove_dir_all(dest);
+                }
+                Err(e.context(format!("forking {}", built.reference())))
+            }
+        }
     }
 
     /// Keep a signature with the Capsule (replacing one by the same key). The signature isn't judged here: it is
@@ -396,6 +439,72 @@ fn combined_digest(manifest: &str, payload: Option<&str>) -> String {
 /// `sha256:` and the first 12 hex digits.
 pub fn short(digest: &str) -> &str {
     &digest[..digest.len().min(19)]
+}
+
+/// What `fork` made.
+#[derive(Clone, Debug)]
+pub struct Forked {
+    pub dir: PathBuf,
+    pub files: u64,
+    pub name: String,
+    pub version: String,
+    /// `NAME@VERSION` of the original
+    pub parent: String,
+}
+
+/// A file name that is safe to create on Windows from untrusted text: no separators, drive or stream colons,
+/// wildcard characters, control characters, trailing dot or space, or reserved device names.
+fn check_local_name(name: &str) -> Result<()> {
+    let stem = name.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.ends_with(|c: char| c.is_ascii_digit() && c != '0'));
+    if name.is_empty() || name == "." || name == ".." || name.ends_with('.') || name.ends_with(' ') || reserved || name.chars().any(|c| c.is_control() || "<>:\"/\\|?*".contains(c)) {
+        bail!("{name:?} can't be created as a file name on Windows");
+    }
+    Ok(())
+}
+
+/// Unpack a payload archive (already checked by [`validate_payload_archive`]) into the folders the manifest's
+/// `payload[].from` entries name, under `dest`. Files are created new, never over an existing one. Returns the
+/// number of files. Windows has no executable bit, so modes aren't kept; `build` re-derives them from `.sh` and `#!`.
+fn extract_payload(capsule: &Capsule, gz: &[u8], dest: &Path) -> Result<u64> {
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(gz));
+    let mut files = 0;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let name: Vec<&str> = path.components().filter_map(|c| if let std::path::Component::Normal(p) = c { p.to_str() } else { None }).collect();
+        let joined = name.join("/");
+        // the most specific payload target that contains the entry says which folder it came from
+        let (target, source) = capsule
+            .spec
+            .payload
+            .iter()
+            .map(|p| (p.to.trim_matches('/'), p))
+            .filter(|(t, _)| joined == *t || joined.starts_with(&format!("{t}/")))
+            .max_by_key(|(t, _)| t.len())
+            .with_context(|| format!("payload entry {joined} matches none of the manifest's payload targets"))?;
+        let mut out = dest.to_owned();
+        for part in source.from.split(['/', '\\']).filter(|c| !c.is_empty() && *c != ".") {
+            check_local_name(part)?;
+            out.push(part);
+        }
+        for part in joined[target.len()..].split('/').filter(|c| !c.is_empty()) {
+            check_local_name(part)?;
+            out.push(part);
+        }
+        match entry.header().entry_type() {
+            tar::EntryType::Directory => std::fs::create_dir_all(&out)?,
+            _ => {
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&out).with_context(|| format!("creating {}", out.display()))?;
+                std::io::copy(&mut entry, &mut file)?;
+                files += 1;
+            }
+        }
+    }
+    Ok(files)
 }
 
 /// Check a payload archive that came from somewhere else, and count its files. Every entry must be a plain file
@@ -756,6 +865,104 @@ mod tests {
         if git_provenance(&src).is_none() {
             assert!(built.provenance.is_none());
         }
+    }
+
+    // ------------------------------------------------------------ fork
+
+    #[test]
+    fn a_fork_rebuilds_to_the_same_payload_with_its_own_identity() {
+        let src = folder("fork-src", "1.2.0");
+        write(&src.join("agent/sub/deep/more.txt"), "deep\n");
+        let store = Store::at(temp("fork-store"));
+        let original = store.build(&src, false).unwrap();
+
+        let dest = temp("fork-out").join("mine");
+        let forked = store.fork(&original, "otherteam/mine", None, &dest).unwrap();
+        assert_eq!((forked.files, forked.version.as_str(), forked.parent.as_str()), (3, "0.1.0", "myteam/tool@1.2.0"));
+
+        let manifest = Capsule::parse(&std::fs::read_to_string(dest.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert_eq!((manifest.metadata.name.as_str(), manifest.metadata.version.as_str()), ("otherteam/mine", "0.1.0"));
+        assert_eq!(manifest.metadata.derived_from.as_deref(), Some("myteam/tool@1.2.0"));
+        assert_eq!(manifest.metadata.derived_digest.as_deref(), Some(original.digest.as_str()));
+        assert_eq!(std::fs::read_to_string(dest.join("agent/sub/deep/more.txt")).unwrap(), "deep\n");
+        assert!(!dest.join("agent/.git").exists());
+
+        // the fork is its own Capsule, but carries exactly the same payload
+        let rebuilt = store.build(&dest, false).unwrap();
+        assert_eq!(rebuilt.reference(), "otherteam/mine@0.1.0");
+        assert_eq!(rebuilt.payload_digest, original.payload_digest);
+        assert_ne!(rebuilt.digest, original.digest);
+    }
+
+    #[test]
+    fn a_fork_can_choose_its_version_and_has_no_authors_source() {
+        let src = temp("forkv-src");
+        write(
+            &src.join(MANIFEST_FILE),
+            &format!("# the original's comment\napiVersion: elpis.dev/v1alpha1\nkind: Capsule\nmetadata: {{ name: myteam/tool, version: 1.0.0, description: a tool, source: {{ git: \"https://example.com/x.git\", commit: abc }} }}\nspec:\n  runtime: {{ image: {DIGEST}, entrypoint: [run] }}\n  requests: {{ network: {{ allow: [example.com] }} }}\n"),
+        );
+        let store = Store::at(temp("forkv-store"));
+        let original = store.build(&src, false).unwrap();
+        let dest = temp("forkv-out").join("f");
+        store.fork(&original, "myteam/tool-two", Some("2.0.0"), &dest).unwrap();
+        let text = std::fs::read_to_string(dest.join(MANIFEST_FILE)).unwrap();
+        let fork = Capsule::parse(&text).unwrap();
+        assert_eq!(fork.metadata.version, "2.0.0");
+        assert!(fork.metadata.source.is_none(), "the original's source doesn't describe the fork");
+        assert_eq!(fork.metadata.description, "a tool");
+        assert_eq!(fork.spec.requests.network.allow, ["example.com"], "everything else is kept");
+        assert!(store.fork(&original, "myteam/tool-three", Some("v2"), &temp("forkv-out2").join("f")).is_err(), "a bad version is refused");
+    }
+
+    #[test]
+    fn a_fork_refuses_the_originals_name_and_a_folder_in_use() {
+        let store = Store::at(temp("forkr-store"));
+        let original = store.build(&folder("forkr-src", "1.0.0"), false).unwrap();
+        let out = temp("forkr-out");
+        let e = store.fork(&original, "myteam/tool", None, &out.join("a")).unwrap_err().to_string();
+        assert!(e.contains("name of its own"), "{e}");
+        assert!(store.fork(&original, "Not A Name", None, &out.join("b")).is_err());
+        assert!(!out.join("a").exists() && !out.join("b").exists(), "a refused fork leaves nothing behind");
+
+        write(&out.join("busy/file.txt"), "mine");
+        let e = store.fork(&original, "myteam/other", None, &out.join("busy")).unwrap_err().to_string();
+        assert!(e.contains("isn't empty"), "{e}");
+        assert_eq!(std::fs::read_to_string(out.join("busy/file.txt")).unwrap(), "mine", "nothing in it was touched");
+        // an existing empty folder is fine
+        std::fs::create_dir_all(out.join("empty")).unwrap();
+        store.fork(&original, "myteam/other", None, &out.join("empty")).unwrap();
+    }
+
+    #[test]
+    fn a_fork_of_a_modified_store_is_refused() {
+        let store = Store::at(temp("forkm-store"));
+        let original = store.build(&folder("forkm-src", "1.0.0"), false).unwrap();
+        std::fs::write(original.payload_path().unwrap(), b"swapped").unwrap();
+        let out = temp("forkm-out").join("f");
+        assert!(format!("{:#}", store.fork(&original, "myteam/other", None, &out).unwrap_err()).contains("modified"));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn fork_extraction_refuses_names_windows_would_misread() {
+        for bad in ["con", "NUL.txt", "com1", "LPT9.log", "a:stream", "x.", "x ", "a*b", "q?", "a\"b", "", "..", "tab\there", "a|b", "a<b"] {
+            assert!(check_local_name(bad).is_err(), "{bad:?}");
+        }
+        for good in ["run.sh", "data.txt", "com0", "comet", "console.log", ".hidden", "a-b_c.d", "COM10"] {
+            assert!(check_local_name(good).is_ok(), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn a_forked_capsule_without_a_payload_has_just_a_manifest() {
+        let src = temp("forknp-src");
+        write(&src.join(MANIFEST_FILE), &manifest("1.0.0", "[]"));
+        let store = Store::at(temp("forknp-store"));
+        let original = store.build(&src, false).unwrap();
+        let dest = temp("forknp-out").join("f");
+        let forked = store.fork(&original, "myteam/np", None, &dest).unwrap();
+        assert_eq!(forked.files, 0);
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
     }
 
     #[test]

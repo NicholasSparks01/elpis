@@ -12,6 +12,7 @@ Set these in the environment of the program you run (`elpis-run`, `elpis-tui`, `
 | `ELPIS_SHIM` | `krun` when Elpis's guest is installed, else `sbx` | Which shim: `krun` (`elpis-shim.exe` beside the program), `sbx` (Docker Sandboxes' installed shim) or a path. `--shim` overrides it per command. |
 | `ELPIS_MKFS` | `vm` when the guest is installed, else `sbx` | How layers and disks are formatted: in a tools VM, or with Docker Sandboxes' `mkfs.*.exe` |
 | `ELPIS_DNS` | the host's first resolver, else `1.1.1.1` | Upstream DNS server (an IP) |
+| `ELPIS_CAPSULE_REGISTRY` | unset | Registry (`REGISTRY[/PREFIX]`) that `capsule search` searches instead of your store; `--registry` overrides it and `--local` ignores it |
 | `ELPIS_NET_DEBUG` | unset | Log IPv4 and ARP frames in both directions (very verbose) |
 
 ### Shim

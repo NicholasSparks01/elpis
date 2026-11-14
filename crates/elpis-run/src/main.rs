@@ -279,6 +279,34 @@ enum CapsuleAction {
     Ls,
     /// Make a box from a built Capsule (asking what to grant it) and open its agent
     Run(CapsuleRunArgs),
+    /// Find Capsules by words in their names and descriptions: in your store, or with --registry in a registry
+    Search {
+        /// Words to look for; all of them must match
+        query: Vec<String>,
+        /// Search this registry (REGISTRY or REGISTRY/PREFIX) instead of your store. Needs a registry that lists
+        /// its repositories. Defaults to $ELPIS_CAPSULE_REGISTRY when that is set
+        #[arg(long)]
+        registry: Option<String>,
+        /// Search your store even if a registry is set
+        #[arg(long, conflicts_with = "registry")]
+        local: bool,
+        /// Every version (up to 10 per Capsule), not just the newest
+        #[arg(long)]
+        all_versions: bool,
+    },
+    /// Start your own Capsule from one: an editable folder with its lineage recorded (a registry reference is pulled first)
+    Fork {
+        /// NAME[@VERSION] of a built Capsule, or REGISTRY/NAMESPACE/NAME:VERSION to pull and fork
+        source: String,
+        /// The fork's name: NAMESPACE/NAME, different from the original's
+        name: String,
+        /// Where to write the folder [default: ./NAME]
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// The fork's version [default: 0.1.0]
+        #[arg(long)]
+        version: Option<String>,
+    },
     /// Make a signing key: the private half goes into Credential Manager, the public key is printed to share
     Keygen { name: String },
     /// List this machine's signing keys with their public keys
@@ -905,6 +933,58 @@ async fn capsule(action: CapsuleAction, log: &Log) -> Result<i32> {
     let store = Store::open();
     match action {
         CapsuleAction::Run(args) => return capsule_run(args, log).await,
+        CapsuleAction::Search { query, registry, local, all_versions } => {
+            let query = query.join(" ");
+            let registry = registry.or_else(|| std::env::var("ELPIS_CAPSULE_REGISTRY").ok().filter(|r| !r.trim().is_empty())).filter(|_| !local);
+            match registry {
+                Some(registry) => {
+                    let (q, r) = (query.clone(), registry.clone());
+                    let found = tokio::task::spawn_blocking(move || elpis::capsuleremote::search(&r, &q, all_versions, &progress)).await??;
+                    for f in &found {
+                        println!("  {}{}", f.reference, if f.signatures_published { "   (signatures published)" } else { "" });
+                        if !f.description.is_empty() {
+                            println!("      {}", elpis::capsule::display_safe(&f.description));
+                        }
+                    }
+                    if found.is_empty() {
+                        println!("  nothing in {registry} matches {query:?}");
+                    } else {
+                        println!("\n  Descriptions come from the registry and are unchecked. Look before you pull: `elpis-run capsule inspect --remote REF`.");
+                        println!("  \"signatures published\" only means someone signed it; after `capsule pull`, `capsule verify` says whether you trust them.");
+                    }
+                }
+                None => {
+                    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+                    for b in store.list() {
+                        let text = format!("{} {}", b.name, b.description).to_lowercase();
+                        if words.iter().all(|w| text.contains(w.as_str())) {
+                            println!("  {:<36} {}  {}{}", b.reference(), short(&b.digest), elpis::capsule::display_safe(&b.description), b.origin.as_ref().map_or(String::new(), |o| format!("  (from {})", elpis::capsule::display_safe(o))));
+                        }
+                    }
+                }
+            }
+        }
+        CapsuleAction::Fork { source, name, dir, version } => {
+            // REGISTRY/NAMESPACE/NAME:VERSION has two or more slashes; NAME[@VERSION] has one
+            let built = if source.matches('/').count() >= 2 {
+                println!("pulling {source}");
+                let src = source.clone();
+                tokio::task::spawn_blocking(move || elpis::capsuleremote::pull(&Store::open(), &src, false, &progress)).await??
+            } else {
+                store.find(&source)?
+            };
+            let dest = std::path::absolute(dir.unwrap_or_else(|| PathBuf::from(name.rsplit('/').next().unwrap_or("capsule"))))?;
+            let forked = store.fork(&built, &name, version.as_deref(), &dest)?;
+            println!("forked {} → {}@{}", forked.parent, forked.name, forked.version);
+            println!("  folder   {}  ({} payload file(s))", forked.dir.display(), forked.files);
+            match elpis::capsulesign::Trust::load() {
+                Ok(trust) => println!("  original {}", standing_line(&elpis::capsulesign::verify(&store, &built, &trust))),
+                Err(e) => println!("  original: couldn't read your trust policy: {e:#}"),
+            }
+            println!("  Edit capsule.yaml and the files, then `elpis-run capsule build {}`; sign and push it to share it.", forked.dir.display());
+            println!("  It is a new, unsigned Capsule: the original's signatures don't apply to it. YAML comments aren't kept, and executable");
+            println!("  bits come back only for .sh files and #! scripts (Windows has none to read).");
+        }
         CapsuleAction::Keygen { name } => {
             let public = elpis::capsulesign::create_key(&name)?;
             println!("created the signing key {name}");
@@ -1025,7 +1105,14 @@ async fn capsule(action: CapsuleAction, log: &Log) -> Result<i32> {
         }
         CapsuleAction::Ls => {
             for b in store.list() {
-                println!("  {:<36} {}  {:>3} file(s)  {}{}", b.reference(), short(&b.digest), b.payload_files, b.description, b.origin.as_ref().map_or(String::new(), |o| format!("  (from {o})")));
+                println!(
+                    "  {:<36} {}  {:>3} file(s)  {}{}",
+                    b.reference(),
+                    short(&b.digest),
+                    b.payload_files,
+                    elpis::capsule::display_safe(&b.description),
+                    b.origin.as_ref().map_or(String::new(), |o| format!("  (from {})", elpis::capsule::display_safe(o)))
+                );
             }
         }
         CapsuleAction::Rm { reference } => {

@@ -126,6 +126,56 @@ impl Registry {
         Registry { reference, agent, token: Mutex::new(None), creds, basic: AtomicBool::new(false) }
     }
 
+    /// A client for registry-level calls (the catalog) on `registry`, logged in if a login is stored for it.
+    pub fn for_host(registry: &str) -> Registry {
+        Registry::new(Reference { registry: registry.to_owned(), repository: String::new(), tag: String::new() })
+    }
+
+    /// A client for another repository on the same registry, with the same login.
+    pub fn sibling(&self, repository: &str, tag: &str) -> Registry {
+        let reference = Reference { registry: self.reference.registry.clone(), repository: repository.to_owned(), tag: tag.to_owned() };
+        Registry::with_login(reference, self.creds.clone())
+    }
+
+    /// The repositories the registry lists (`GET /v2/_catalog`), at most `limit`. Many registries don't offer it
+    /// (Docker Hub and GitHub's don't), which comes back as an HTTP error.
+    pub fn catalog(&self, limit: usize) -> Result<Vec<String>> {
+        self.get_paged(format!("{}://{}/v2/_catalog?n=100", self.scheme(), self.reference.api_host()), "repositories", limit)
+    }
+
+    /// The tags of `repository` on this registry, at most 5000.
+    pub fn tags(&self, repository: &str) -> Result<Vec<String>> {
+        self.get_paged(format!("{}://{}/v2/{repository}/tags/list?n=500", self.scheme(), self.reference.api_host()), "tags", 5000)
+    }
+
+    /// A list endpoint that pages with `Link: <…>; rel="next"`. Never follows a link to another host.
+    fn get_paged(&self, first: String, key: &str, limit: usize) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let mut url = first;
+        for _ in 0..100 {
+            let response = self.get(&url, None)?;
+            let next = response.header("link").and_then(next_link);
+            let mut body = Vec::new();
+            response.into_reader().take(8 << 20).read_to_end(&mut body)?;
+            let page: Value = serde_json::from_slice(&body).with_context(|| format!("{url} didn't return JSON"))?;
+            out.extend(page[key].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_owned)));
+            if out.len() >= limit {
+                out.truncate(limit);
+                break;
+            }
+            let Some(next) = next else { break };
+            let base = format!("{}://{}", self.scheme(), self.reference.api_host());
+            url = if next.starts_with('/') {
+                format!("{base}{next}")
+            } else if next.starts_with(&format!("{base}/")) {
+                next
+            } else {
+                bail!("the registry's next page is on another host ({next}); not following it");
+            };
+        }
+        Ok(out)
+    }
+
     fn scheme(&self) -> &'static str {
         if is_local_host(&self.reference.registry) { "http" } else { "https" }
     }
@@ -318,6 +368,14 @@ impl Registry {
     pub fn blob(&self, digest: &str) -> Result<Box<dyn Read + Send + Sync>> {
         Ok(self.get(&self.url("blobs", digest), None)?.into_reader())
     }
+}
+
+/// The target of a `rel="next"` entry in a `Link` header.
+fn next_link(header: &str) -> Option<String> {
+    header.split(',').find(|p| p.contains("rel=\"next\"") || p.contains("rel=next")).and_then(|p| {
+        let (start, end) = (p.find('<')?, p.find('>')?);
+        (start < end).then(|| p[start + 1..end].to_owned())
+    })
 }
 
 fn basic_header((user, password): &(String, String)) -> String {
@@ -633,6 +691,15 @@ impl<R: Read> Read for Counting<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_headers_give_the_next_page() {
+        assert_eq!(next_link("</v2/_catalog?last=b&n=100>; rel=\"next\"").as_deref(), Some("/v2/_catalog?last=b&n=100"));
+        assert_eq!(next_link("<https://r.example/v2/x/tags/list?last=1>; rel=\"next\", <x>; rel=\"prev\"").as_deref(), Some("https://r.example/v2/x/tags/list?last=1"));
+        assert_eq!(next_link("</a>; rel=\"prev\""), None);
+        assert_eq!(next_link(""), None);
+        assert_eq!(next_link(">oops<; rel=\"next\""), None);
+    }
 
     #[test]
     fn only_this_machine_is_reached_over_plain_http() {
