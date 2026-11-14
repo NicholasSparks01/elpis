@@ -103,22 +103,6 @@ pub fn login_service(registry: &str) -> String {
     format!("registry.{}", registry.replace(':', "_"))
 }
 
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
 /// A registry client for one repository, holding its token and, if there is one, its login.
 pub struct Registry {
     pub reference: Reference,
@@ -337,7 +321,7 @@ impl Registry {
 }
 
 fn basic_header((user, password): &(String, String)) -> String {
-    format!("Basic {}", base64(format!("{user}:{password}").as_bytes()))
+    format!("Basic {}", crate::b64::encode(format!("{user}:{password}").as_bytes()))
 }
 
 fn verify(digest: &str, actual: &[u8; 32]) -> Result<()> {
@@ -649,13 +633,6 @@ impl<R: Read> Read for Counting<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn base64_matches_the_rfc_vectors() {
-        for (plain, encoded) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy"), ("user:pass", "dXNlcjpwYXNz")] {
-            assert_eq!(base64(plain.as_bytes()), encoded);
-        }
-    }
 
     #[test]
     fn only_this_machine_is_reached_over_plain_http() {

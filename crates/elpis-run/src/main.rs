@@ -213,6 +213,9 @@ struct CapsuleRunArgs {
     /// Grant everything the Capsule asks for without asking
     #[arg(long)]
     yes: bool,
+    /// Run it even though your trust policy requires a signature from a trusted key and it has none
+    #[arg(long)]
+    allow_unsigned: bool,
     /// Open a shell instead of the agent
     #[arg(long)]
     shell: bool,
@@ -227,6 +230,27 @@ struct CapsuleRunArgs {
     /// Stop the box this many seconds after its last terminal closes; 0 keeps it running [default: the Capsule's]
     #[arg(long, value_name = "SECONDS")]
     auto_stop: Option<u64>,
+}
+
+#[derive(Subcommand)]
+enum TrustAction {
+    /// Trust a public key to vouch for Capsules in the named namespaces
+    Add {
+        /// A label for it in reports
+        name: String,
+        /// ed25519:… as printed by the signer's `capsule keygen` / `capsule keys`
+        public_key: String,
+        /// A namespace this key may vouch for (repeatable); '*' for all. Required: a key trusted for one team
+        /// must not be able to vouch for another's Capsules
+        #[arg(long = "namespace", required = true, value_name = "NS")]
+        namespaces: Vec<String>,
+    },
+    /// List trusted keys and the policy
+    Ls,
+    /// Stop trusting a key
+    Rm { name: String },
+    /// `on`: `capsule run` refuses Capsules without a signature from a trusted key; `off`: it only says so
+    Require { mode: String },
 }
 
 #[derive(Subcommand)]
@@ -255,6 +279,30 @@ enum CapsuleAction {
     Ls,
     /// Make a box from a built Capsule (asking what to grant it) and open its agent
     Run(CapsuleRunArgs),
+    /// Make a signing key: the private half goes into Credential Manager, the public key is printed to share
+    Keygen { name: String },
+    /// List this machine's signing keys with their public keys
+    Keys,
+    /// Sign a built Capsule: vouch for its exact contents and the git state it was built from
+    Sign {
+        /// NAME@VERSION of a built Capsule
+        reference: String,
+        /// The signing key's name (see `capsule keys`)
+        #[arg(long)]
+        key: String,
+    },
+    /// Check a built Capsule: its files, its payload, and its signatures against your trust policy
+    Verify {
+        reference: String,
+        /// Fail unless a key you trust has signed it (your policy's `require` setting already does this when on)
+        #[arg(long)]
+        require_signed: bool,
+    },
+    /// Choose whose signatures you trust
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
     /// Upload a built Capsule to an OCI registry as REGISTRY[/PREFIX]/NAMESPACE/NAME:VERSION
     Push {
         /// NAME@VERSION of a built Capsule
@@ -857,6 +905,72 @@ async fn capsule(action: CapsuleAction, log: &Log) -> Result<i32> {
     let store = Store::open();
     match action {
         CapsuleAction::Run(args) => return capsule_run(args, log).await,
+        CapsuleAction::Keygen { name } => {
+            let public = elpis::capsulesign::create_key(&name)?;
+            println!("created the signing key {name}");
+            println!("  public key  {public}");
+            println!("  The private key stays in Credential Manager (elpis/capsule-key.{name}). Share the public key;");
+            println!("  others trust it with `elpis-run capsule trust add {name} {public} --namespace NS`.");
+        }
+        CapsuleAction::Keys => {
+            for (name, public) in elpis::capsulesign::keys() {
+                println!("  {name:<24} {public}");
+            }
+        }
+        CapsuleAction::Sign { reference, key } => {
+            let built = store.find(&reference)?;
+            store.load(&built)?; // don't vouch for files that no longer match their build
+            let record = elpis::capsulesign::sign(&elpis::capsulesign::load_key(&key)?, &built)?;
+            store.add_signature(&built, &record)?;
+            println!("signed {} with {key} (key id {})", built.reference(), record.key_id);
+            match &built.provenance {
+                None => println!("  no git provenance: it wasn't built from a git repository, so the signature says nothing about its source"),
+                Some(p) if p.dirty => println!("  note: it was built from a folder with uncommitted changes, so commit {} doesn't fully describe it", p.commit.as_deref().unwrap_or("?")),
+                Some(p) => println!("  source: {} @ {}", p.git.as_deref().unwrap_or("(no remote)"), p.commit.as_deref().unwrap_or("?")),
+            }
+            println!("  `capsule push {} REGISTRY` publishes the signature with the Capsule", built.reference());
+        }
+        CapsuleAction::Verify { reference, require_signed } => {
+            let trust = elpis::capsulesign::Trust::load()?;
+            let built = store.find(&reference)?;
+            let report = elpis::capsulesign::verify(&store, &built, &trust);
+            print_report(&report);
+            let needs_signature = require_signed || trust.require_signed;
+            return Ok(if !report.intact() || (needs_signature && !report.is_trusted()) { 1 } else { 0 });
+        }
+        CapsuleAction::Trust { action } => {
+            use elpis::capsulesign::Trust;
+            let mut trust = Trust::load()?;
+            match action {
+                TrustAction::Add { name, public_key, namespaces } => {
+                    trust.add(&name, &public_key, &namespaces)?;
+                    trust.save()?;
+                    println!("trusting {name} for {}", namespaces.join(", "));
+                }
+                TrustAction::Ls => {
+                    println!("  signatures required to run: {}", if trust.require_signed { "yes" } else { "no" });
+                    for k in &trust.keys {
+                        println!("  {:<20} {}  for {}", k.name, k.public_key, k.namespaces.join(", "));
+                    }
+                }
+                TrustAction::Rm { name } => {
+                    if !trust.remove(&name) {
+                        anyhow::bail!("no trusted key named {name} (`capsule trust ls` lists them)");
+                    }
+                    trust.save()?;
+                    println!("no longer trusting {name}");
+                }
+                TrustAction::Require { mode } => {
+                    trust.require_signed = match mode.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        other => anyhow::bail!("{other:?}: say `on` or `off`"),
+                    };
+                    trust.save()?;
+                    println!("`capsule run` now {} a signature from a trusted key", if trust.require_signed { "requires" } else { "doesn't require" });
+                }
+            }
+        }
         CapsuleAction::Build { dir, force } => {
             let b = store.build(&dir, force)?;
             println!("built {}", b.reference());
@@ -871,15 +985,20 @@ async fn capsule(action: CapsuleAction, log: &Log) -> Result<i32> {
             let pushed = tokio::task::spawn_blocking(move || elpis::capsuleremote::push(&Store::open(), &spec, &to, force, &progress)).await??;
             println!("{} {}", if pushed.uploaded { "pushed" } else { "already there:" }, pushed.reference);
             println!("  digest   {}", pushed.digest);
+            println!("  signed   {}", if pushed.signatures == 0 { "no signatures (`capsule sign`, then push again)".to_owned() } else { format!("{} signature(s) in the registry", pushed.signatures) });
             println!("  pin it:  elpis-run capsule pull {}@{}", pushed.reference.rsplit_once(':').map_or(pushed.reference.as_str(), |(r, _)| r), pushed.digest);
-            println!("  Capsules aren't signed yet: anyone who can write this tag can replace it, so share the pinned form.");
+            println!("  Anyone who can write this tag can replace it; signatures and the pinned form above let others tell.");
         }
         CapsuleAction::Pull { reference, force } => {
             let built = tokio::task::spawn_blocking(move || elpis::capsuleremote::pull(&Store::open(), &reference, force, &progress)).await??;
             println!("pulled {}", built.reference());
             println!("  digest   {}", short(&built.digest));
             println!("  stored   {}", built.path.display());
-            println!("  nothing runs until you `capsule run` it, and that asks what to grant; `capsule inspect {}` shows what it asks for", built.reference());
+            match elpis::capsulesign::Trust::load() {
+                Ok(trust) => println!("  {}", standing_line(&elpis::capsulesign::verify(&store, &built, &trust))),
+                Err(e) => println!("  couldn't read your trust policy: {e:#}"),
+            }
+            println!("  nothing runs until you `capsule run` it, and that asks what to grant; `capsule verify {0}` and `capsule inspect {0}` show more", built.reference());
         }
         CapsuleAction::Inspect { target, json, remote: true } => {
             let (capsule, digest) = tokio::task::spawn_blocking(move || elpis::capsuleremote::inspect(&target)).await??;
@@ -917,6 +1036,57 @@ async fn capsule(action: CapsuleAction, log: &Log) -> Result<i32> {
     Ok(0)
 }
 
+/// One line on who vouches for a Capsule, in terms of the consumer's policy.
+fn standing_line(report: &elpis::capsulesign::Report) -> String {
+    use elpis::capsulesign::Standing;
+    if !report.intact() {
+        return "INTEGRITY CHECK FAILED: the stored files no longer match the build (see `capsule verify`)".to_owned();
+    }
+    let signers = report.trusted_signers();
+    if !signers.is_empty() {
+        return format!("signed by {} (trusted)", signers.join(", "));
+    }
+    let valid = report.signatures.iter().filter(|s| !matches!(s.standing, Standing::Invalid(_))).count();
+    match (report.signatures.len(), valid) {
+        (0, _) => "unsigned: nobody vouches for it".to_owned(),
+        (_, 0) => "has signatures, but none is valid for this Capsule".to_owned(),
+        _ => "signed, but not by a key you trust (`capsule verify` shows who)".to_owned(),
+    }
+}
+
+fn print_report(report: &elpis::capsulesign::Report) {
+    use elpis::capsulesign::Standing;
+    println!("{}  {}", report.reference, elpis::capsulestore::short(&report.digest));
+    for c in &report.checks {
+        match &c.result {
+            Ok(detail) => println!("  ok    {} ({detail})", c.name),
+            Err(why) => println!("  FAIL  {}: {why}", c.name),
+        }
+    }
+    match &report.provenance {
+        None => println!("  source: not recorded (it wasn't built from a git repository)"),
+        Some(p) => println!(
+            "  source: {} @ {}{}",
+            p.git.as_deref().unwrap_or("(no remote)"),
+            p.commit.as_deref().unwrap_or("?"),
+            if p.dirty { "  (built with uncommitted changes)" } else { "" }
+        ),
+    }
+    if report.signatures.is_empty() {
+        println!("  signatures: none");
+    }
+    for s in &report.signatures {
+        let what = match &s.standing {
+            Standing::Trusted(name) => format!("valid, by {name}, whom you trust for this namespace"),
+            Standing::OutOfScope(name) => format!("valid, by {name}, but you don't trust that key for this namespace"),
+            Standing::Unknown => format!("valid, by a key you haven't trusted ({})", s.public_key),
+            Standing::Invalid(why) => format!("INVALID: {why}"),
+        };
+        println!("  signature {}: {what}", s.key_id);
+    }
+    println!("  verdict: {}", standing_line(report));
+}
+
 /// A box name from the parts: letters, digits and hyphens, at most 40 characters.
 fn box_name(parts: &[&str]) -> String {
     let joined: String = parts.join("-").chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
@@ -942,6 +1112,19 @@ async fn capsule_run(args: CapsuleRunArgs, log: &Log) -> Result<i32> {
     let store = Store::open();
     let built = store.find(&args.reference)?;
     let capsule = store.load(&built)?; // checks the stored files still match the build
+    // Who vouches for it, by the consumer's own policy. Checked before anything is asked or created.
+    let trust = elpis::capsulesign::Trust::load()?;
+    let report = elpis::capsulesign::verify(&store, &built, &trust);
+    if !report.intact() {
+        anyhow::bail!("{} failed its integrity check; run `elpis-run capsule verify {}` for details", capsule.reference(), capsule.reference());
+    }
+    if trust.require_signed && !report.is_trusted() && !args.allow_unsigned {
+        anyhow::bail!(
+            "{} is not signed by a key you trust ({}), and your policy requires that. Trust its signer (`capsule trust add`), turn the requirement off (`capsule trust require off`), or pass --allow-unsigned for this run",
+            capsule.reference(),
+            standing_line(&report)
+        );
+    }
     if !capsule.compatible_with(env!("CARGO_PKG_VERSION"))? {
         anyhow::bail!("{} needs a newer Elpis ({})", capsule.reference(), capsule.spec.compatibility.elpis.as_deref().unwrap_or_default());
     }
@@ -977,7 +1160,8 @@ async fn capsule_run(args: CapsuleRunArgs, log: &Log) -> Result<i32> {
     // Requests are not grants: show what would be granted, and nothing is created until it's approved
     let requests = &capsule.spec.requests;
     let grants = requests.grantable();
-    println!("{} asks for:", capsule.reference());
+    println!("{}: {}", capsule.reference(), standing_line(&report));
+    println!("  asks for:");
     if grants.network.is_empty() {
         println!("  network   none (the box will be offline)");
     } else {

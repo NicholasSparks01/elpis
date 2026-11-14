@@ -10,6 +10,7 @@
 //! on the machine or ship a credential. Stored Capsules are re-hashed on load.
 
 use crate::capsule::{Capsule, PayloadEntry, looks_like_secret, parse_version, validate_capsule_name};
+use crate::capsulesign::{SignatureRecord, is_key_id};
 use crate::session::debug_root;
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
@@ -23,11 +24,54 @@ use std::path::{Path, PathBuf};
 pub const MANIFEST_FILE: &str = "capsule.yaml";
 pub const PAYLOAD_FILE: &str = "payload.tar.gz";
 const RECORD_FILE: &str = "build.json";
+const SIGNATURES_DIR: &str = "signatures";
 /// A payload bigger than this is almost certainly a mistake (a `node_modules`, a disk image): fail loudly.
 const MAX_PAYLOAD_BYTES: u64 = 256 << 20;
 const MAX_PAYLOAD_ENTRIES: u64 = 100_000;
 /// Files up to this size are scanned for secrets.
 const SCAN_LIMIT: u64 = 2 << 20;
+
+/// Where a build came from. Recorded by `build` from git, and repeated in what a signer vouches for. `dirty` is
+/// true when the folder had uncommitted changes, so the commit alone doesn't describe what was built.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Provenance {
+    /// The `origin` remote, without any credentials in the URL
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    pub dirty: bool,
+}
+
+fn git(folder: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git").arg("-C").arg(folder).args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// `https://user:token@host/x` → `https://host/x`: a remote URL may carry a credential, and this ends up in a registry.
+fn strip_userinfo(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest.split_once('/').map_or((rest, None), |(a, p)| (a, Some(p)));
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            match path {
+                Some(p) => format!("{scheme}://{host}/{p}"),
+                None => format!("{scheme}://{host}"),
+            }
+        }
+        None => url.to_owned(),
+    }
+}
+
+/// The git state of `folder`, or None when it isn't in a repository (or git isn't installed).
+pub fn git_provenance(folder: &Path) -> Option<Provenance> {
+    let commit = git(folder, &["rev-parse", "HEAD"]).filter(|c| !c.is_empty())?;
+    let remote = git(folder, &["remote", "get-url", "origin"]).filter(|u| !u.is_empty()).map(|u| strip_userinfo(&u));
+    // anything uncommitted in this folder counts, untracked files included; if git can't say, assume dirty
+    let dirty = git(folder, &["status", "--porcelain", "--", "."]).is_none_or(|s| !s.is_empty());
+    Some(Provenance { git: remote, commit: Some(commit), dirty })
+}
 
 /// What `build` recorded about a stored Capsule version.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -46,6 +90,9 @@ pub struct Built {
     /// The registry reference it was pulled from; None for a local build
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// The git state of the folder it was built from, if that was a repository. Signatures carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
     #[serde(skip)]
     pub path: PathBuf,
 }
@@ -114,6 +161,7 @@ impl Store {
             payload_files,
             payload_bytes: payload.as_ref().map_or(0, |p| p.len() as u64),
             origin: None,
+            provenance: git_provenance(folder),
             path: PathBuf::new(),
         };
         self.install(built, &bytes, payload.as_deref(), force)
@@ -142,9 +190,35 @@ impl Store {
             payload_files,
             payload_bytes: payload.map_or(0, |p| p.len() as u64),
             origin: Some(origin.to_owned()),
+            provenance: None,
             path: PathBuf::new(),
         };
         self.install(built, manifest, payload, force)
+    }
+
+    /// Keep a signature with the Capsule (replacing one by the same key). The signature isn't judged here: it is
+    /// checked, against a trust policy, when the Capsule is verified.
+    pub fn add_signature(&self, built: &Built, record: &SignatureRecord) -> Result<()> {
+        if !is_key_id(&record.key_id) {
+            bail!("refusing a signature with the key id {:?}; key ids are 16 hex digits", record.key_id);
+        }
+        let dir = built.path.join(SIGNATURES_DIR);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(format!("{}.json", record.key_id)), serde_json::to_vec_pretty(record)?).context("storing the signature")
+    }
+
+    /// The signatures kept with a Capsule, by key id. Files that don't parse are skipped.
+    pub fn signatures(&self, built: &Built) -> Vec<SignatureRecord> {
+        let mut found: Vec<SignatureRecord> = std::fs::read_dir(built.path.join(SIGNATURES_DIR))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter_map(|e| serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok())
+            .filter(|r: &SignatureRecord| is_key_id(&r.key_id))
+            .collect();
+        found.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        found
     }
 
     /// The manifest and payload bytes of a stored Capsule, after [`Store::load`]'s integrity check. For pushing.
@@ -643,6 +717,45 @@ mod tests {
         assert!(store.find("../../etc").is_err());
         assert!(store.find("myteam/tool@../x").is_err());
         assert!(store.find("myteam/tool@1.0.0").is_err());
+    }
+
+    #[test]
+    fn remote_urls_lose_their_credentials() {
+        assert_eq!(strip_userinfo("https://user:tok@github.com/org/repo.git"), "https://github.com/org/repo.git");
+        assert_eq!(strip_userinfo("https://github.com/org/repo.git"), "https://github.com/org/repo.git");
+        assert_eq!(strip_userinfo("ssh://git@host:2222/a/b"), "ssh://host:2222/a/b");
+        assert_eq!(strip_userinfo("https://tok@host"), "https://host");
+        assert_eq!(strip_userinfo("git@github.com:org/repo.git"), "git@github.com:org/repo.git", "scp-style remotes name a user, not a secret");
+    }
+
+    #[test]
+    fn builds_record_the_git_state_they_came_from() {
+        let src = folder("git-src", "1.0.0");
+        let run = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&src).args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"]).args(args).output().is_ok_and(|o| o.status.success());
+        if !(run(&["init", "-q"]) && run(&["add", "-A"]) && run(&["commit", "-q", "-m", "x"])) {
+            return; // no usable git here
+        }
+        let store = Store::at(temp("git-store"));
+        let first = store.build(&src, false).unwrap().provenance.unwrap();
+        assert_eq!((first.commit.as_ref().map(String::len), first.dirty, first.git), (Some(40), false, None));
+
+        assert!(run(&["remote", "add", "origin", "https://user:secret-token@example.com/team/tool.git"]));
+        write(&src.join("agent/sub/data.txt"), "edited\n");
+        let second = store.build(&src, true).unwrap().provenance.unwrap();
+        assert!(second.dirty, "uncommitted changes are noted");
+        assert_eq!(second.git.as_deref(), Some("https://example.com/team/tool.git"), "the credential never reaches the record");
+        let record = std::fs::read_to_string(store.find("myteam/tool").unwrap().path.join(RECORD_FILE)).unwrap();
+        assert!(!record.contains("secret-token"));
+    }
+
+    #[test]
+    fn a_folder_outside_git_has_no_provenance() {
+        let src = folder("nogit-src", "1.0.0");
+        // temp dirs aren't repositories unless the machine's temp folder is inside one
+        let built = Store::at(temp("nogit-store")).build(&src, false).unwrap();
+        if git_provenance(&src).is_none() {
+            assert!(built.provenance.is_none());
+        }
     }
 
     #[test]

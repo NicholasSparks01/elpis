@@ -96,7 +96,7 @@ A template freezes a stopped box's writable layer as a read-only layer on top of
 
 ## Capsules (preview)
 
-A **Capsule** is a portable description of an agent: image, start command, files, and what it asks for (network, credentials). It is not a VM snapshot, so it carries no tokens or state. The manifest is described in [Capsule manifest](capsule-manifest.md). You can build, inspect, list, run, push and pull Capsules; signing and a team catalog (search, fork) aren't implemented yet.
+A **Capsule** is a portable description of an agent: image, start command, files, and what it asks for (network, credentials). It is not a VM snapshot, so it carries no tokens or state. The manifest is described in [Capsule manifest](capsule-manifest.md). You can build, inspect, list, run, push, pull, sign and verify Capsules; a team catalog (search, fork) isn't implemented yet.
 
 | Task | Command |
 |---|---|
@@ -104,6 +104,10 @@ A **Capsule** is a portable description of an agent: image, start command, files
 | Upload to a registry | `capsule push NAME@VERSION REGISTRY[/PREFIX] [--force]` |
 | Download from a registry | `capsule pull REGISTRY/NAMESPACE/NAME:VERSION [--force]` (`@sha256:…` instead of `:VERSION` pins it) |
 | Look before pulling | `capsule inspect --remote REGISTRY/NAMESPACE/NAME:VERSION` |
+| Make a signing key | `capsule keygen NAME` (prints the public key to share) |
+| Sign a built Capsule | `capsule sign NAME@VERSION --key NAME` |
+| Check files, payload and signatures | `capsule verify NAME@VERSION [--require-signed]` (exit 1 on a failure) |
+| Trust someone's signatures | `capsule trust add LABEL ed25519:… --namespace NS`, `trust ls`, `trust rm LABEL`, `trust require on\|off` |
 | Validate a folder and store it as `NAME@VERSION` | `capsule build [DIR]` |
 | Replace a version built with different content | `capsule build DIR --force` |
 | Show what it runs and asks for | `capsule inspect NAME[@VERSION]` or `capsule inspect DIR` (`--json` prints the manifest) |
@@ -114,13 +118,19 @@ A **Capsule** is a portable description of an agent: image, start command, files
 
 `capsule run` verifies the stored Capsule, prints what it asks for and waits for a yes (`--yes` accepts everything it asks for), pulls its image, and makes a box named `CAPSULE-FOLDER` (or `--name`) whose network policy is default `deny` plus an allow rule for each granted host. It then opens the agent, as `run` does. If the box already exists from the same build it is reused; from a different build, or not from a Capsule, it stops and tells you. A Capsule with a workspace shares `DIR` (default: the current folder) at the path and access it declares; one without refuses a folder. `-p` publishes only ports the Capsule declares. `capsule.lock` in the box folder records what was requested and granted.
 
+### Signing and trust
+
+A signature says that the holder of a key vouched for a Capsule's exact bytes (manifest and payload) and for the git state it was built from. `capsule keygen alice` makes an Ed25519 key: the private half stays in Credential Manager (`elpis/capsule-key.alice`, never printed), the public half (`ed25519:…`) is what you share. `capsule sign NAME@VERSION --key alice` signs a built Capsule; `capsule push` publishes the signatures with it (sign after pushing, then push again). `capsule build` records the git commit, the `origin` URL (credentials stripped) and whether the folder had uncommitted changes, and the signature carries that; a Capsule built outside git is signed without provenance, and `sign` says so.
+
+A signature counts only if you trust its key. `capsule trust add bob ed25519:… --namespace myteam` trusts bob's key for Capsules named `myteam/…` and nothing else (`--namespace` is required; `'*'` means every namespace). Signatures from a registry are checked cryptographically when you pull but earn no trust by being there. `capsule verify` re-checks the stored files against the build, re-checks the payload archive, and reports each signature as trusted, trusted for another namespace, valid but by an unknown key, or invalid. With `capsule trust require on`, `capsule run` refuses a Capsule that has no signature from a trusted key (`--allow-unsigned` overrides for one run); `run` always reports who has signed it and refuses a Capsule whose files fail the integrity check. The policy lives in `capsule-trust.json` in the data folder. There are no certificates, expiry or revocation: if a key is lost or leaked, everyone who trusted it removes it with `trust rm`.
+
 ### Sharing through a registry
 
 Any OCI registry holds Capsules (Docker Hub, GitHub Container Registry, a private one). `capsule push mytest/demo@0.1.0 registry.example.com/team` stores `registry.example.com/team/mytest/demo:0.1.0`: the manifest and the payload, byte for byte, so the digest after `capsule pull` is the one you built. The tag is the version; pushing the same content again does nothing, and pushing different content under an existing version fails unless you pass `--force`. `inspect --remote` reads only the manifest, so you can see what a Capsule asks for without downloading its payload.
 
 For a private registry, or any push, store a login (it goes only to that registry): `elpis-run secret set registry.HOST` with the value `user:password` (a token works as the password; write `:` as `_` in a host with a port, e.g. `registry.localhost_5000`). Registries on `localhost` are reached over plain HTTP; everything else needs HTTPS.
 
-Nothing is signed yet, so whoever can write a tag can replace what it holds. `push` prints the digest-pinned form; sharing and pulling `…@sha256:…` guarantees you get what was reviewed. Pull treats the registry as untrusted: the manifest is re-validated, every payload entry must be a plain file or folder inside the manifest's payload targets (no links, `..` or setuid bits), the size is capped, and all digests are recomputed. A pulled Capsule only runs through `capsule run`, which asks what to grant.
+Whoever can write a tag can replace what it holds, so `push` prints the digest-pinned form: pulling `…@sha256:…` guarantees you get what was reviewed, and signatures (below) say who vouches for it. Pull treats the registry as untrusted: the manifest is re-validated, every payload entry must be a plain file or folder inside the manifest's payload targets (no links, `..` or setuid bits), the size is capped, and all digests are recomputed. A pulled Capsule only runs through `capsule run`, which asks what to grant.
 
 The payload is a read-only layer *under* the image's own layers, so the image's directories keep their owners. A file the image already has at a payload path wins over the payload's. Credential requests aren't injected yet: the agent signs in itself. Run uses the same VM path as `run` and `create`, which CI can't boot, so check it on a real box (see CLAUDE.md).
 

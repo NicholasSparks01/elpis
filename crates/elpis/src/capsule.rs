@@ -38,7 +38,9 @@ pub struct Metadata {
     pub version: String,
     #[serde(default)]
     pub description: String,
-    /// Filled in by `capsule build`
+    /// Where the author says the source lives. Informational only: it is part of the manifest, so the author
+    /// wrote it. The git state `capsule build` actually saw is recorded separately (`Built::provenance`) and is
+    /// what signatures carry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<GitSource>,
     /// `namespace/name@version` of the Capsule this was forked from

@@ -12,10 +12,12 @@
 //! kit type.
 
 use crate::capsule::Capsule;
+use crate::capsulesign::{SignatureRecord, is_key_id, verify_record};
 use crate::capsulestore::{Built, Store, capsule_digest};
 use crate::registry::{Reference, Registry};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub const ARTIFACT_TYPE: &str = "application/vnd.elpis.capsule.v1";
 pub const CONFIG_MEDIA: &str = "application/vnd.elpis.capsule.config.v1+yaml";
@@ -26,6 +28,10 @@ const EMPTY_MEDIA: &str = "application/vnd.oci.empty.v1+json";
 const EMPTY_DIGEST: &str = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 /// The Capsule's own digest, repeated on the manifest so `push` can tell "already there" from "different"
 const ANNOTATION_DIGEST: &str = "dev.elpis.capsule.digest";
+pub const SIGNATURES_TYPE: &str = "application/vnd.elpis.capsule.signatures.v1";
+pub const SIGNATURE_MEDIA: &str = "application/vnd.elpis.capsule.signature.v1+json";
+const MAX_SIGNATURES: usize = 64;
+const MAX_SIGNATURE_BYTES: u64 = 16 << 10;
 const MAX_CONFIG_BYTES: u64 = 1 << 20;
 const MAX_PAYLOAD_BYTES: u64 = 256 << 20;
 
@@ -37,6 +43,8 @@ pub struct Pushed {
     pub digest: String,
     /// False when the registry already held this exact Capsule
     pub uploaded: bool,
+    /// How many signatures the registry holds for it afterwards
+    pub signatures: usize,
 }
 
 /// Where `built` goes under `dest` (`REGISTRY` or `REGISTRY/PREFIX`): `dest/NAMESPACE/NAME:VERSION`.
@@ -61,19 +69,36 @@ pub fn push_to(registry: &Registry, store: &Store, built: &Built, force: bool, p
     let reference = registry.reference.to_string();
 
     // A release is immutable: the same content is fine, different content needs --force
+    let mut already = None;
     if let Some((body, digest)) = registry.manifest_bytes(&tag, MANIFEST_MEDIA)? {
         let remote: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         if remote["annotations"][ANNOTATION_DIGEST].as_str() == Some(built.digest.as_str()) {
             progress(&format!("{reference} already has this Capsule"));
-            return Ok(Pushed { reference, digest, uploaded: false });
-        }
-        if !force {
+            already = Some(digest);
+        } else if !force {
             bail!("{reference} already exists with different content; a release is immutable, so bump metadata.version, or pass --force to overwrite it");
         }
     }
+    let (digest, uploaded) = match already {
+        Some(digest) => (digest, false),
+        None => (upload_content(registry, built, &manifest_yaml, payload.as_deref(), progress)?, true),
+    };
 
+    // Signatures go up either way, so signing an already-pushed Capsule and pushing again publishes the signature.
+    // Only signatures that are valid for exactly this Capsule are sent.
+    let valid: Vec<SignatureRecord> = store.signatures(built).into_iter().filter(|r| verify_record(r, &built.name, &built.version, &built.digest).is_ok()).collect();
+    let signatures = push_signatures(registry, &built.digest, &valid)?;
+    if signatures > 0 {
+        progress(&format!("{signatures} signature(s) published"));
+    }
+    Ok(Pushed { reference, digest, uploaded, signatures })
+}
+
+/// Upload the config, payload and manifest; returns the registry manifest's digest.
+fn upload_content(registry: &Registry, built: &Built, manifest_yaml: &[u8], payload: Option<&[u8]>, progress: &dyn Fn(&str)) -> Result<String> {
+    let tag = registry.reference.tag.clone();
     progress(&format!("uploading the manifest ({} bytes)", manifest_yaml.len()));
-    registry.push_blob(&built.manifest_digest, &manifest_yaml)?;
+    registry.push_blob(&built.manifest_digest, manifest_yaml)?;
     let layer = match (&built.payload_digest, &payload) {
         (Some(digest), Some(bytes)) => {
             progress(&format!("uploading the payload ({:.1} KB)", bytes.len() as f64 / 1024.0));
@@ -97,8 +122,72 @@ pub fn push_to(registry: &Registry, store: &Store, built: &Built, force: bool, p
             ANNOTATION_DIGEST: built.digest,
         },
     });
-    let digest = registry.push_manifest(&tag, MANIFEST_MEDIA, &serde_json::to_vec(&manifest)?)?;
-    Ok(Pushed { reference, digest, uploaded: true })
+    registry.push_manifest(&tag, MANIFEST_MEDIA, &serde_json::to_vec(&manifest)?)
+}
+
+/// Where a Capsule's signatures live: a tag derived from its content digest, so signing doesn't touch the release tag.
+pub fn signatures_tag(capsule_digest: &str) -> String {
+    format!("sha256-{}.sig", capsule_digest.trim_start_matches("sha256:"))
+}
+
+/// The signatures a registry holds for a Capsule. Unreadable ones are skipped; none of them is trusted by being here.
+pub fn fetch_signatures(registry: &Registry, capsule_digest: &str) -> Result<Vec<SignatureRecord>> {
+    let Some((body, _)) = registry.manifest_bytes(&signatures_tag(capsule_digest), MANIFEST_MEDIA)? else { return Ok(Vec::new()) };
+    let manifest: Value = serde_json::from_slice(&body).context("the registry's signature manifest isn't JSON")?;
+    if manifest["artifactType"] != SIGNATURES_TYPE {
+        bail!("the registry's signature tag holds something that isn't an Elpis signature set");
+    }
+    let mut found = Vec::new();
+    for layer in manifest["layers"].as_array().into_iter().flatten().filter(|l| l["mediaType"] == SIGNATURE_MEDIA).take(MAX_SIGNATURES) {
+        let Some(digest) = layer["digest"].as_str() else { continue };
+        if layer["size"].as_u64().is_none_or(|s| s > MAX_SIGNATURE_BYTES) {
+            continue;
+        }
+        let blob = registry.blob_limited(digest, MAX_SIGNATURE_BYTES)?;
+        if let Ok(record) = serde_json::from_slice::<SignatureRecord>(&blob)
+            && is_key_id(&record.key_id)
+        {
+            found.push(record);
+        }
+    }
+    Ok(found)
+}
+
+/// Add `records` to the registry's signature set for a Capsule, keeping what is already there (a record from the
+/// same key replaces the old one). Returns how many signatures the set holds afterwards.
+pub fn push_signatures(registry: &Registry, capsule_digest: &str, records: &[SignatureRecord]) -> Result<usize> {
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let existing = fetch_signatures(registry, capsule_digest)?;
+    let mut merged: std::collections::BTreeMap<String, SignatureRecord> = existing.iter().map(|r| (r.key_id.clone(), r.clone())).collect();
+    for r in records {
+        merged.insert(r.key_id.clone(), r.clone());
+    }
+    if merged.len() == existing.len() && merged.values().all(|r| existing.contains(r)) {
+        return Ok(existing.len());
+    }
+    if merged.len() > MAX_SIGNATURES {
+        bail!("the registry already holds {} signatures for this Capsule; refusing to add more", existing.len());
+    }
+    registry.push_blob(EMPTY_DIGEST, b"{}")?;
+    let mut layers = Vec::new();
+    for r in merged.values() {
+        let bytes = serde_json::to_vec(r)?;
+        let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        registry.push_blob(&digest, &bytes)?;
+        layers.push(json!({ "mediaType": SIGNATURE_MEDIA, "digest": digest, "size": bytes.len(), "annotations": { "dev.elpis.capsule.keyid": r.key_id } }));
+    }
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": MANIFEST_MEDIA,
+        "artifactType": SIGNATURES_TYPE,
+        "config": { "mediaType": EMPTY_MEDIA, "digest": EMPTY_DIGEST, "size": 2 },
+        "layers": layers,
+        "annotations": { ANNOTATION_DIGEST: capsule_digest },
+    });
+    registry.push_manifest(&signatures_tag(capsule_digest), MANIFEST_MEDIA, &serde_json::to_vec(&manifest)?)?;
+    Ok(merged.len())
 }
 
 /// Pull `reference` (`REGISTRY/NAMESPACE/NAME:VERSION`, or `@sha256:…` to pin) into the local store.
@@ -168,13 +257,23 @@ pub fn pull_from(registry: &Registry, store: &Store, force: bool, progress: &dyn
     {
         bail!("the registry's annotation says this Capsule is {claimed}, but its contents hash to {digest}");
     }
-    store.import(&config, payload.as_deref(), &registry.reference.to_string(), force)
+    let built = store.import(&config, payload.as_deref(), &registry.reference.to_string(), force)?;
+
+    // Keep the signatures that are cryptographically valid for exactly this Capsule; whether any of them is
+    // trusted is for `verify` and the consumer's trust policy to say, not the registry.
+    match fetch_signatures(registry, &built.digest) {
+        Ok(found) => {
+            let kept = found.iter().filter(|r| verify_record(r, &built.name, &built.version, &built.digest).is_ok() && store.add_signature(&built, r).is_ok()).count();
+            progress(&format!("{kept} valid signature(s) of {} found", found.len()));
+        }
+        Err(e) => progress(&format!("couldn't read signatures: {e:#}")),
+    }
+    Ok(built)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -505,6 +604,101 @@ mod tests {
         let e = format!("{:#}", pull_from(&client(&m, "myteam/tool:1.0.0", None), &local, false, &quiet).unwrap_err());
         assert!(e.contains("immutable") && e.contains("--force"), "{e}");
         assert_eq!(pull_from(&client(&m, "myteam/tool:1.0.0", None), &local, true, &quiet).unwrap().digest, built.digest);
+    }
+
+    // ------------------------------------------------------------ signatures through the registry
+
+    fn signer() -> (Vec<u8>, String) {
+        let (pkcs8, public) = crate::capsulesign::generate().unwrap();
+        (pkcs8, crate::capsulesign::public_key_string(&public))
+    }
+
+    #[test]
+    fn signatures_travel_with_the_capsule_and_stay_untrusted_until_the_consumer_says() {
+        use crate::capsulesign::{Standing, Trust, sign, verify};
+        let m = mock(Auth::Open);
+        let (store, built) = store_with("sig-a", "1.0.0", true);
+        let (alice, alice_pub) = signer();
+        store.add_signature(&built, &sign(&alice, &built).unwrap()).unwrap();
+        let r = client(&m, "myteam/tool:1.0.0", None);
+        let pushed = push_to(&r, &store, &built, false, &quiet).unwrap();
+        assert_eq!(pushed.signatures, 1);
+        assert!(m.state.lock().unwrap().manifests.keys().any(|k| k.ends_with(&signatures_tag(&built.digest))));
+
+        let b = Store::at(temp("sig-b"));
+        let got = pull_from(&r, &b, false, &quiet).unwrap();
+        assert_eq!(b.signatures(&got).len(), 1);
+        assert_eq!(verify(&b, &got, &Trust::default()).signatures[0].standing, Standing::Unknown, "arriving from a registry earns no trust");
+        let mut trust = Trust::default();
+        trust.add("alice", &alice_pub, &["myteam".into()]).unwrap();
+        assert!(verify(&b, &got, &trust).is_trusted());
+    }
+
+    #[test]
+    fn signing_after_pushing_publishes_on_the_next_push_and_signers_accumulate() {
+        use crate::capsulesign::sign;
+        let m = mock(Auth::Open);
+        let (store, built) = store_with("sig-late", "1.0.0", true);
+        let r = client(&m, "myteam/tool:1.0.0", None);
+        let first = push_to(&r, &store, &built, false, &quiet).unwrap();
+        assert_eq!(first.signatures, 0);
+        assert!(!m.state.lock().unwrap().manifests.keys().any(|k| k.ends_with(".sig")), "unsigned: no signature tag");
+
+        let (alice, _) = signer();
+        store.add_signature(&built, &sign(&alice, &built).unwrap()).unwrap();
+        let again = push_to(&r, &store, &built, false, &quiet).unwrap();
+        assert!(!again.uploaded && again.signatures == 1, "the Capsule was already there; the signature still goes up");
+
+        // a second signer, from another machine's store, adds to the set instead of replacing it
+        let other = Store::at(temp("sig-other"));
+        let copy = pull_from(&r, &other, false, &quiet).unwrap();
+        let (bob, _) = signer();
+        other.add_signature(&copy, &sign(&bob, &copy).unwrap()).unwrap();
+        assert_eq!(push_to(&r, &other, &copy, false, &quiet).unwrap().signatures, 2);
+        assert_eq!(fetch_signatures(&r, &built.digest).unwrap().len(), 2);
+        // pushing the same set again changes nothing
+        assert_eq!(push_to(&r, &other, &copy, false, &quiet).unwrap().signatures, 2);
+    }
+
+    #[test]
+    fn pull_keeps_only_signatures_that_are_valid_for_this_capsule() {
+        use crate::capsulesign::sign;
+        let m = mock(Auth::Open);
+        let (store, built) = store_with("sig-junk", "1.0.0", true);
+        let r = client(&m, "myteam/tool:1.0.0", None);
+        push_to(&r, &store, &built, false, &quiet).unwrap();
+        // a registry holding a real signature for a different Capsule, and a forgery, under this Capsule's tag
+        let (carol, _) = signer();
+        let (_, elsewhere) = store_with("sig-junk-else", "2.0.0", true);
+        let foreign = sign(&carol, &elsewhere).unwrap();
+        let mut forged = sign(&carol, &built).unwrap();
+        forged.statement = forged.statement.replace("myteam/tool", "myteam/other");
+        let (dave, _) = signer();
+        let genuine = sign(&dave, &built).unwrap();
+        push_signatures(&r, &built.digest, &[foreign, forged, genuine.clone()]).unwrap();
+
+        let b = Store::at(temp("sig-junk-b"));
+        let got = pull_from(&r, &b, false, &quiet).unwrap();
+        assert_eq!(b.signatures(&got), vec![genuine]);
+    }
+
+    #[test]
+    fn a_signature_tag_that_is_not_a_signature_set_is_not_believed() {
+        let m = mock(Auth::Open);
+        let (store, built) = store_with("sig-wrong", "1.0.0", true);
+        let r = client(&m, "myteam/tool:1.0.0", None);
+        push_to(&r, &store, &built, false, &quiet).unwrap();
+        // the Capsule's own manifest, planted at the signature tag
+        {
+            let mut s = m.state.lock().unwrap();
+            let body = s.manifests["myteam/tool:1.0.0"].clone();
+            s.manifests.insert(format!("myteam/tool:{}", signatures_tag(&built.digest)), body);
+        }
+        assert!(fetch_signatures(&r, &built.digest).unwrap_err().to_string().contains("isn't an Elpis signature set"));
+        // pull still succeeds, reporting that it couldn't read signatures
+        let notes = std::cell::RefCell::new(Vec::new());
+        pull_from(&r, &Store::at(temp("sig-wrong-b")), false, &|l: &str| notes.borrow_mut().push(l.to_owned())).unwrap();
+        assert!(notes.borrow().iter().any(|l| l.contains("couldn't read signatures")));
     }
 
     #[test]

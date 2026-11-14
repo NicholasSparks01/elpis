@@ -1,6 +1,6 @@
 # Capsule manifest (proposal)
 
-> **Status: draft.** The manifest types and validation (`crates/elpis/src/capsule.rs`), the local store, and `elpis-run capsule build|inspect|ls|rm|run|push|pull` (`capsulestore.rs`, `capsuleremote.rs`, see [Usage](usage.md#capsules-preview)) exist. `run` applies the runtime, payload, workspace, ports, volumes, Docker, network grants and host access. `mcp`, `bindings`, credential injection, `tests`, registries and signing are not applied yet. This describes "Capsules": portable, versioned packages of an agent implementation (not a VM snapshot) that each user instantiates as their own box.
+> **Status: draft.** The manifest types and validation (`crates/elpis/src/capsule.rs`), the local store, and `elpis-run capsule build|inspect|ls|rm|run|push|pull|keygen|keys|sign|verify|trust` (`capsulestore.rs`, `capsuleremote.rs`, `capsulesign.rs`, see [Usage](usage.md#capsules-preview)) exist. `run` applies the runtime, payload, workspace, ports, volumes, Docker, network grants and host access. `mcp`, `bindings`, credential injection and `tests` are not applied yet. This describes "Capsules": portable, versioned packages of an agent implementation (not a VM snapshot) that each user instantiates as their own box.
 >
 > Payload files are packed owned by root with mode 0644 (0755 for `.sh` and `#!` files), so an agent running as a non-root `runtime.user` can read them but not modify them. Whether the manifest needs an `owner` or writable-path option is an open decision.
 
@@ -15,7 +15,8 @@ metadata:
   name: myteam/code-reviewer          # namespace/name
   version: 1.2.0                      # immutable once published
   description: Reviews a diff and writes comments
-  # filled in by `capsule build`, never by hand
+  # optional and informational (the author wrote it). The git state that `capsule build` actually saw is
+  # recorded separately and carried by signatures.
   source: { git: "https://example.com/myteam/code-reviewer.git", commit: "<sha>" }
   derivedFrom: myteam/base-reviewer@1.0.0     # set by `fork`
 
@@ -101,9 +102,11 @@ spec:
 
 A Capsule is an OCI image manifest with `artifactType` `application/vnd.elpis.capsule.v1`. Its config blob (`application/vnd.elpis.capsule.config.v1+yaml`) is `capsule.yaml` as written, and its one layer (`application/vnd.elpis.capsule.payload.v1.tar+gzip`) is the payload, or the standard OCI empty layer when there is none. The repository is `REGISTRY[/PREFIX]/NAMESPACE/NAME` and the tag is `metadata.version`; the manifest also carries the Capsule's own digest as the annotation `dev.elpis.capsule.digest`. These media types are Elpis's own, not sbx's kit type.
 
+Signatures live beside it under the tag `sha256-<capsule digest>.sig` (the digest without `sha256:`): an OCI manifest with `artifactType` `application/vnd.elpis.capsule.signatures.v1` and one layer (`application/vnd.elpis.capsule.signature.v1+json`) per signer. A signature is Ed25519 over `elpis-capsule-signature-v1\n` plus a statement (JSON text stored with the signature) giving the Capsule's name, version and digest, the git provenance `build` recorded, and the signing time. The digest covers the manifest and the payload, so a signature vouches for every byte. Being in the registry confers no trust: a signature counts only if its key is in the consumer's trust policy for the Capsule's namespace.
+
 ## Open decisions
 
 - Whether `mcp.servers` is a manifest concept, or just `startup` steps plus a generated config file for the agent.
 - OCI layout: one artifact with the manifest as the config blob and `payload` as layers is the simplest fit with the existing registry code.
 - How `bindings` are supplied on the CLI (e.g. `--bind tickets=https://…`).
-- Trust root for signatures (e.g. cosign) before `publish` ships.
+- Signatures are Elpis's own Ed25519 scheme with a local trust policy, not cosign or Sigstore: no certificate chain, transparency log, key expiry or revocation. A lost or leaked key is handled by removing it from each consumer's trust (`capsule trust rm`). Whether to add Sigstore (keyless identities, a log) later is open.

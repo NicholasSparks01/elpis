@@ -937,6 +937,7 @@ dependencies = [
  "anyhow",
  "flate2",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

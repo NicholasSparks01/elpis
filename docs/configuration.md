@@ -36,9 +36,10 @@ Set these in the environment of the program you run (`elpis-run`, `elpis-tui`, `
 | `images\` | Pulled image manifests and configs; `images\layers\` holds converted erofs layers, shared by digest |
 | `kits\` | Cached kit specs |
 | `templates\` | Saved templates |
-| `capsules\NAMESPACE\NAME\VERSION\` | Built Capsules: `capsule.yaml` as written, `payload.tar.gz`, and `build.json` with the digests |
+| `capsules\NAMESPACE\NAME\VERSION\` | Built Capsules: `capsule.yaml` as written, `payload.tar.gz`, `build.json` with the digests and git provenance, and `signatures\KEYID.json` |
 | `capsules\.layers\` | Payloads converted to erofs layers by `capsule run`, shared by boxes from the same build |
 | `proxy\` | The credential proxy's CA (`ca.pem`, `ca.key.pem`) |
+| `capsule-trust.json` | Your Capsule signing policy: trusted public keys with their namespaces, and whether `capsule run` requires a signature |
 
 Moving the whole folder is safe while no box is running; point `ELPIS_HOME` at the new place.
 
