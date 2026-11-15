@@ -96,6 +96,7 @@ elpis-shim passes all ten on a real box. See its [README](../crates/elpis-shim/R
 | `0001-windows-external-kernel` | External kernels were disabled on Windows. Added an ELF `PT_LOAD` loader entered through the 64-bit boot protocol (Windows vCPUs have no PVH setup). |
 | `0002-windows-virtio-rtc` | virtio-rtc was Linux-only (`clock_gettime`, `timerfd`). Added Windows clocks and an EventFd-based alarm timer. |
 | `0003-whp-forward-apic-eoi` | WHP `ApicEoi` exits were ignored, so the userspace IOAPIC never cleared Remote-IRR and virtio-pci (level-triggered INTx) stalled after the first interrupts. |
+| `0004-windows-fs-read-at-eof` | A virtio-fs read at or past end of file returned Windows' `ERROR_HANDLE_EOF` (38) unmapped, which the guest read as `ENOSYS`; programs that read a shared file until EOF (Python, uv, Go, `docker compose`) failed with "Function not implemented". It now returns 0 bytes. |
 
 Also learned:
 - the guest needs ACPI even on MMIO
