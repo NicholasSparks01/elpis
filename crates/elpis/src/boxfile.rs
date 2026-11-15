@@ -192,14 +192,54 @@ pub fn shell_quote(s: &str) -> String {
 
 const STEP_LIMIT: Duration = Duration::from_secs(600);
 
+/// Runs as root on every boot. The container starts with an empty /etc/hosts, so `localhost` must be added or Python, Go and
+/// others can't resolve it (curl hard-codes it, which hid this). An existing `localhost` line is kept.
+const HOSTS_STEP: &str = r#"sed -i '/elpis-hostline/d;/host\.docker\.internal/d' /etc/hosts 2>/dev/null; grep -qw localhost /etc/hosts 2>/dev/null || printf '127.0.0.1 localhost\n::1 localhost\n' >> /etc/hosts; echo "127.0.0.1 $(hostname) # elpis-hostline" >> /etc/hosts"#;
+
+#[cfg(test)]
+mod tests {
+    use super::HOSTS_STEP;
+    use std::process::Command;
+
+    /// Runs the step against a scratch hosts file, with `/etc/hosts` and `hostname` swapped for test stand-ins.
+    fn run_step(initial: &str) -> Option<String> {
+        let dir = std::env::temp_dir().join(format!("elpis-hosts-test-{}-{}", std::process::id(), initial.len()));
+        std::fs::create_dir_all(&dir).ok()?;
+        let hosts = dir.join("hosts");
+        std::fs::write(&hosts, initial).ok()?;
+        let script = HOSTS_STEP.replace("/etc/hosts", &hosts.to_string_lossy().replace('\\', "/")).replace("$(hostname)", "mybox");
+        // Skip where there's no POSIX sh (the step only ever runs inside the Linux guest)
+        let status = Command::new("sh").arg("-c").arg(&script).status().ok()?;
+        assert!(status.success());
+        let out = std::fs::read_to_string(&hosts).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    #[test]
+    fn empty_hosts_gets_localhost_and_the_box_name() {
+        let Some(out) = run_step("") else { return };
+        assert!(out.contains("127.0.0.1 localhost\n"), "{out}");
+        assert!(out.contains("::1 localhost\n"), "{out}");
+        assert!(out.contains("127.0.0.1 mybox # elpis-hostline\n"), "{out}");
+    }
+
+    #[test]
+    fn existing_localhost_is_kept_once_and_old_lines_are_replaced() {
+        let Some(out) = run_step("127.0.0.1 localhost\n10.0.0.5 host.docker.internal\n127.0.0.1 old # elpis-hostline\n") else { return };
+        assert_eq!(out.matches("localhost").count(), 1, "{out}");
+        assert!(!out.contains("host.docker.internal") && !out.contains(" old "), "{out}");
+        assert!(out.contains("127.0.0.1 mybox # elpis-hostline\n"), "{out}");
+    }
+}
+
 /// Run a box's setup after the container starts. Failures are logged and don't stop the box.
 pub async fn setup(work: &Path, execs: &Execs, log: &Log) {
     let Some(mut file) = BoxFile::load(work) else { return };
     let root = Some(json!({ "uid": 0, "gid": 0 }));
 
     // The box's own name resolves (sudo and some tools look it up), and host.docker.internal comes from our DNS
-    let hosts = r#"sed -i '/elpis-hostline/d;/host\.docker\.internal/d' /etc/hosts 2>/dev/null; echo "127.0.0.1 $(hostname) # elpis-hostline" >> /etc/hosts"#;
-    execs.run_as(json!(["sh", "-c", hosts]), root.clone(), "hosts entry").await;
+    execs.run_as(json!(["sh", "-c", HOSTS_STEP]), root.clone(), "hosts entry").await;
 
     if file.docker {
         start_docker(execs, log).await;
