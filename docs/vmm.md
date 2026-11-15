@@ -97,6 +97,7 @@ elpis-shim passes all ten on a real box. See its [README](../crates/elpis-shim/R
 | `0002-windows-virtio-rtc` | virtio-rtc was Linux-only (`clock_gettime`, `timerfd`). Added Windows clocks and an EventFd-based alarm timer. |
 | `0003-whp-forward-apic-eoi` | WHP `ApicEoi` exits were ignored, so the userspace IOAPIC never cleared Remote-IRR and virtio-pci (level-triggered INTx) stalled after the first interrupts. |
 | `0004-windows-fs-read-at-eof` | A virtio-fs read at or past end of file returned Windows' `ERROR_HANDLE_EOF` (38) unmapped, which the guest read as `ENOSYS`; programs that read a shared file until EOF (Python, uv, Go, `docker compose`) failed with "Function not implemented". It now returns 0 bytes. |
+| `0005-windows-fs-no-stdout-in-errors` | `win_err_to_linux` printed to stdout, which panics when the shim's stdout is a closed pipe. The panic killed the single virtio-fs worker thread, so every request on every shared folder hung afterwards. A failed symlink (no symlink privilege) was enough to trigger it; it now returns `EPERM`. |
 
 Also learned:
 - the guest needs ACPI even on MMIO

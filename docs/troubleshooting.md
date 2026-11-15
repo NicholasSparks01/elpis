@@ -31,6 +31,8 @@
 
 **Commands with quotes break in PowerShell 5.1.** It strips inner double quotes; wrap the whole command in single quotes.
 
+**Symlinks in a shared folder fail with "Operation not permitted".** Windows only lets a program create symlinks with the symlink privilege, which a normal user gets by turning on Developer Mode (Settings > System > For developers). Without it, tools that make symlinks in a workspace (for example a Python virtualenv) fail. Keep such files inside the box, for example `UV_PROJECT_ENVIRONMENT=/home/agent/venv` for uv, or turn Developer Mode on and restart the box.
+
 **The guest clock is wrong.** The shim resyncs at boot, on resume and on host clock jumps. Set `ELPIS_CLOCK_RESYNC_SECS=60` to also resync periodically.
 
 ## Network
