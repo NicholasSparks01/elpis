@@ -1,0 +1,20 @@
+diff --git a/src/devices/src/virtio/file_traits.rs b/src/devices/src/virtio/file_traits.rs
+--- a/src/devices/src/virtio/file_traits.rs
++++ b/src/devices/src/virtio/file_traits.rs
+@@ -514,7 +514,15 @@ macro_rules! volatile_impl {
+                 if ret != 0 {
+                     Ok(bytes_read as usize)
+                 } else {
+-                    Err(Error::last_os_error())
++                    let err = Error::last_os_error();
++                    // An offset read at or past end of file fails with ERROR_HANDLE_EOF (38) on Windows, where
++                    // pread returns 0. Passed on as-is, 38 reaches the guest as ENOSYS and breaks every reader
++                    // that loops until end of file (Python, Rust, Go).
++                    if err.raw_os_error() == Some(38) {
++                        Ok(0)
++                    } else {
++                        Err(err)
++                    }
+                 }
+             }
+             fn read_vectored_at_volatile(
